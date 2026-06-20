@@ -29,6 +29,7 @@
   - [11.10 RMII 时钟与 PCB 关键设计要点](#1110-rmii-时钟与-pcb-关键设计要点)
   - [11.11 常见问题与调试技巧](#1111-常见问题与调试技巧)
   - [11.12 LWIP 集成要点](#1112-lwip-集成要点)
+  - [配套文档：Ethernet PHY & Switch 驱动固件深度解读](Ethernet_PHY_Switch_Deep_Dive.md) — PHY/Switch 驱动完整实现
 
 ---
 
@@ -2578,6 +2579,7 @@ void phy_dump_registers(uint8_t phy_addr) {
 - [ESP-IDF OTA 文档](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/ota.html)
 - [RISC-V Privileged Architecture Spec](https://riscv.org/technical/specifications/)
 - [IEEE 802.3-2022 Standard](https://standards.ieee.org/ieee/802.3/10435/)
+- [Ethernet PHY & Switch 驱动固件深度解读](Ethernet_PHY_Switch_Deep_Dive.md) — PHY/Switch 驱动实现与网络协议概念解析 (完整配套文档)
 - [LAN8720A Datasheet (SMSC/Microchip)](https://www.microchip.com/en-us/product/LAN8720A)
 - [DP83848 Datasheet (TI)](https://www.ti.com/product/DP83848)
 - [KSZ8081 Datasheet (Microchip)](https://www.microchip.com/en-us/product/KSZ8081)
