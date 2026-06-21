@@ -8260,4 +8260,1031 @@ void wait_for_arp(uint32_t target_ip)
 
 ---
 
+## Appendix E: Timing Diagrams and Protocol Visualizations
+
+> 本章节使用 ASCII 艺术图直观展示以太网协议各层面的时序关系，帮助初学者建立从"协议文本描述"到"实际总线信号/交互流程"的视觉映射。每个图表均附有详细的时序参数说明和 C 代码示例，可用于嵌入式调试中的时序验证。
+
+---
+
+### E.1 以太网帧传输时序（Ethernet Frame Transmission Timing）
+
+以太网帧在物理介质上的传输是严格串行的——从 Preamble 开始，到 FCS 结束，帧间至少保持 96 bit-time 的 IFG（Inter-Frame Gap）。对于 100Mbps 速率，1 bit-time = 10ns。
+
+```
+      IDLE         PREAMBLE (7 bytes)         SFD       DEST MAC (6B)     SRC MAC (6B)     ETYPE (2B)
+        │    ┌──┬──┬──┬──┬──┬──┬──┬──┐    ┌──┐    ┌──┬──┬──┬──┬──┬──┐    ┌──┬──┬──┬──┬──┬──┐    ┌──┬──┐
+   ......    │55│55│55│55│55│55│55│55│    │D5│    │AA│BB│CC│DD│EE│FF│    │11│22│33│44│55│66│    │08│00│    ......
+        │    └──┴──┴──┴──┴──┴──┴──┴──┘    └──┘    └──┴──┴──┴──┴──┴──┘    └──┴──┴──┴──┴──┴──┘    └──┴──┘
+        │    10101010 重复 7 次           10101011   MAC 目标地址           MAC 源地址            0x0800 = IPv4
+
+              PAYLOAD (46-1500 bytes)              FCS (4B)          IFG (12B idle)
+        ┌──┬──┬──┬──┬──┬──┬──┬──┐    ┌──┬──┬──┐    ┌──┬──┬──┬──┐    ┌──┬──┬──┬──┐
+   ......│45│00│00│2E│..│..│..│..│....│..│..│..│    │XX│XX│XX│XX│    │  │  │  │  │......
+        └──┴──┴──┴──┴──┴──┴──┴──┘    └──┴──┴──┘    └──┴──┴──┴──┘    └──┴──┴──┴──┘
+        IP header + TCP/UDP + data   填充至 >= 46B   CRC32 校验和      最小 96 bit-time
+```
+
+**关键时序参数（100BASE-TX）**：
+
+| 字段 | 长度 | 时间（@100Mbps） | 说明 |
+|------|------|-------------------|------|
+| Preamble | 7 字节 | 560 ns | 10MHz 方波，接收端用于时钟同步 |
+| SFD | 1 字节 | 80 ns | 起始帧定界符，标志帧数据开始 |
+| 最小帧 | 64 字节 | 5.12 μs | 含 14B 头部 + 46B 净荷 + 4B FCS |
+| 最大帧 | 1518 字节 | 121.44 μs | 不含 Preamble 和 SFD |
+| IFG | 12 字节 | 960 ns | 帧间隔，供接收端处理完成前一帧 |
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+
+/* 计算以太网帧传输时间（微秒） */
+float ethernet_frame_time_us(uint16_t payload_len, int is_100mbps)
+{
+    /* 帧总字节：14(头部) + payload + 4(FCS) + 8(Preamble+SFD) + 12(IFG) */
+    uint16_t total_bytes = 14 + payload_len + 4 + 8 + 12;
+    float    bit_time_us = is_100mbps ? 0.01f : 0.1f;   /* 100M:10ns, 10M:100ns */
+    return (float)total_bytes * 8 * bit_time_us;
+}
+
+/* 打印帧时序诊断信息 */
+void print_frame_timing(uint16_t payload_len)
+{
+    float t_10m  = ethernet_frame_time_us(payload_len, 0);
+    float t_100m = ethernet_frame_time_us(payload_len, 1);
+
+    printf("Payload: %u bytes\n", payload_len);
+    printf("  10Mbps: %.2f us  (%.1f pps)\n", t_10m, 1000000.0f / t_10m);
+    printf("  100Mbps: %.2f us  (%.1f pps)\n", t_100m, 1000000.0f / t_100m);
+
+    if (payload_len < 46)
+        printf("  *** 警告：净荷 < 46，需填充至 46 字节！\n");
+}
+```
+
+**初学者常见误区**：
+- Preamble 和 SFD 不在 Wireshark 中显示——网卡在接收时已剥离它们
+- IFG 是强制要求，不是"建议"——违反 IFG 的帧会被丢弃
+- 帧最小 64 字节（不含 Preamble）——小于 64B 为 runts（残帧），正常网络不应出现
+
+---
+
+### E.2 ARP 请求/应答交换时序（ARP Request/Response Exchange）
+
+ARP 的核心是"一问一答"：发送者广播查询，目标单播回复。关键特征是请求使用广播 MAC（FF-FF-FF-FF-FF-FF），而应答使用单播 MAC。
+
+```
+      PC1 (192.168.1.1)                          PC2 (192.168.1.2)
+      MAC: 00:0C:29:12:34:56                     MAC: 00:11:22:33:44:55
+           │                                            │
+           │  --- [ARP Request] 广播 --->                │
+           │  Dest MAC: FF-FF-FF-FF-FF-FF                │
+           │  Sender MAC: 00:0C:29:12:34:56              │
+           │  Sender IP:  192.168.1.1                    │
+           │  Target IP:  192.168.1.2                    │
+           │  "Who has 192.168.1.2? Tell 192.168.1.1"    │
+           │────────────────────────────────────────────>│
+           │                                            │
+           │  PC2 收到广播，检查 Target IP == 自身 IP     │
+           │  匹配！PC2 将 PC1 的 IP+MAC 加入 ARP 缓存    │
+           │  构造 ARP Reply（交换 Sender/Target 字段）    │
+           │                                            │
+           │  <--- [ARP Reply] 单播 ---                   │
+           │  Dest MAC: 00:0C:29:12:34:56                │
+           │  Sender MAC: 00:11:22:33:44:55              │
+           │  Sender IP:  192.168.1.2                    │
+           │  Target IP:  192.168.1.1                    │
+           │  "192.168.1.2 is at 00:11:22:33:44:55"      │
+           │<────────────────────────────────────────────│
+           │                                            │
+           │  PC1 收到 Reply，将 PC2 加入 ARP 缓存        │
+           │  现在可以发送 IP 数据包到 PC2                │
+```
+
+**ARP 缓存状态转换图**：
+
+```
+                  +-----------+
+                  |   EMPTY   |   (初始状态：无条目)
+                  +-----------+
+                       │
+                       │ 发送 ARP Request（或收到请求）
+                       ▼
+                  +-----------+
+           +----->| INCOMPLETE|   (请求已发出，等待回复)
+           |      +-----------+
+           |           │
+           |           │ 收到 ARP Reply
+           |           ▼
+           |      +-----------+        +----------+
+           |      | VALID     |------->| STALE    |  (超过生存时间)
+           |      +-----------+        +----------+
+           |           │                    │
+           |           │ 应用层查询          │ 尝试使用该条目
+           |           ▼                    ▼
+           |      +-----------+        +----------+
+           |      | RESOLVED  |        | DELAY    |  (发送单播探测)
+           |      +-----------+        +----------+
+           |                              │
+           |                              │ 收到回复
+           +------------------------------+
+```
+
+**ARP 超时重传（典型嵌入式实现）**：
+
+```c
+#define ARP_MAX_RETRIES  3
+#define ARP_TIMEOUT_MS   1000   /* 每次重试间隔（ms） */
+
+typedef struct {
+    uint32_t ip_addr;
+    uint8_t  mac_addr[6];
+    int      state;         /* 0=EMPTY, 1=INCOMPLETE, 2=VALID */
+    int      retry_count;
+    uint32_t timer_start_ms;
+} arp_entry_t;
+
+/* ARP 状态机轮询（在 main loop 中调用） */
+void arp_poll(arp_entry_t *entry, uint32_t now_ms)
+{
+    if (entry->state != 1)          /* 不是 INCOMPLETE，无需处理 */
+        return;
+
+    if (now_ms - entry->timer_start_ms < ARP_TIMEOUT_MS)
+        return;                     /* 尚未超时 */
+
+    if (entry->retry_count >= ARP_MAX_RETRIES) {
+        printf("ARP failed for %d.%d.%d.%d\n",
+               (entry->ip_addr >> 24) & 0xFF,
+               (entry->ip_addr >> 16) & 0xFF,
+               (entry->ip_addr >> 8) & 0xFF,
+               entry->ip_addr & 0xFF);
+        entry->state = 0;           /* 回退到 EMPTY */
+        return;
+    }
+
+    /* 重发 ARP Request */
+    entry->retry_count++;
+    entry->timer_start_ms = now_ms;
+    arp_send_request(entry->ip_addr);
+    printf("ARP retry %d/3 for %d.%d.%d.%d\n",
+           entry->retry_count,
+           (entry->ip_addr >> 24) & 0xFF,
+           (entry->ip_addr >> 16) & 0xFF,
+           (entry->ip_addr >> 8) & 0xFF,
+           entry->ip_addr & 0xFF);
+}
+```
+
+**典型时序实测值**（在 Cortex-M4 + LAN8720 平台上测得）：
+
+| 操作 | 耗时 | 说明 |
+|------|------|------|
+| 发送 ARP Request | ~50 μs | 构造帧 + MAC 发送（含 DMA 描述符操作） |
+| 对方处理 + 回复 | ~200-500 μs | 取决于对方 CPU 负载 |
+| 收到 Reply 到缓存更新 | < 10 μs | 中断上下文中完成 |
+| 一次成功 ARP 总耗时 | ~0.3-1 ms | 同一网段内 |
+| 三次超时总耗时 | ~3 秒 | 1s × 3 次重试 |
+
+---
+
+### E.3 ICMP Ping 时序（ICMP Echo Sequence）
+
+Ping 是最常用的网络连通性测试工具，其本质是 ICMP Echo Request/Echo Reply 交换。ICMP 协议直接承载在 IP 之上（Protocol = 1），不经过 TCP/UDP 端口。
+
+```
+      PC1 (ping -c 1 192.168.1.2)             Device (responder)
+      IP: 192.168.1.1                         IP: 192.168.1.2
+           │                                          │
+           │  +-- Ethernet Frame (ARP 已解析) --+      │
+           │  | Dest MAC: 00:11:22:33:44:55     |      │
+           │  | Src MAC:  00:0C:29:12:34:56     |      │
+           │  | EtherType: 0x0800 (IPv4)        |      │
+           │  |                                |      │
+           │  | +-- IP Header (20 bytes) ---+  |      │
+           │  | | Version=4, IHL=5           |  |      │
+           │  | | Total Length: 60 (0x003C)  |  |      │
+           │  | | Protocol: 1 (ICMP)         |  |      │
+           │  | | TTL: 64                    |  |      │
+           │  | | Src: 192.168.1.1           |  |      │
+           │  | | Dst: 192.168.1.2           |  |      │
+           │  | | Checksum: 0xXXXX          |  |      │
+           │  | +----------------------------+  |      │
+           │  |                                |      │
+           │  | +-- ICMP Echo Request ------+  |      │
+           │  | | Type: 8 (Echo Request)    |  |      │
+           │  | | Code: 0                   |  |      │
+           │  | | Checksum: 0xXXXX          |  |      │
+           │  | | Identifier: 0x1234        |  |      │
+           │  | | Sequence: 1               |  |      │
+           │  | | Data: 56 bytes of payload |  |      │
+           │  | +----------------------------+  |      │
+           │  +--------------------------------+      │
+           │                                          │
+           │  === 以太网传输：最快 ~5μs（同子网直连）===   │
+           │                                          │
+           │        ┌─────────────────────┐            │
+           │        │ 设备收到 Echo Req    │            │
+           │        │ 1. 检验 Ethernet FCS│            │
+           │        │ 2. IP 校验和验证     │            │
+           │        │ 3. ICMP 校验和验证   │            │
+           │        │ 4. Type==8, 构造 Reply│           │
+           │        │ 5. 交换 Src/Dest    │            │
+           │        │ 6. Type=0, 重算校验和│            │
+           │        │ 处理时间: ~1-2ms    │            │
+           │        └─────────────────────┘            │
+           │                                          │
+           │  <--- ICMP Echo Reply (type=0, seq=1) --- │
+           │<──────────────────────────────────────────│
+           │                                          │
+           │  PC1 收到 Reply，计算 RTT：               │
+           │  RTT = T_receive - T_send               │
+           │  = 2.345 ms (典型值，同网段直连)          │
+           │                                          │
+           │  Ping 统计输出：                           │
+           │  64 bytes from 192.168.1.2: icmp_seq=1    │
+           │  ttl=64 time=2.34 ms                      │
+```
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+
+/* ICMP Echo Request 头部结构（网络字节序） */
+typedef struct __attribute__((packed)) {
+    uint8_t  type;        /* 8: Echo Request, 0: Echo Reply */
+    uint8_t  code;        /* 始终为 0 */
+    uint16_t checksum;
+    uint16_t identifier;
+    uint16_t sequence;
+    uint8_t  data[];      /* 可选数据负载 */
+} icmp_echo_t;
+
+/* ICMP 校验和计算（16-bit one's complement sum） */
+uint16_t icmp_checksum(void *buf, int len)
+{
+    uint16_t *p   = (uint16_t *)buf;
+    uint32_t  sum = 0;
+
+    while (len > 1) {
+        sum += *p++;
+        len -= 2;
+    }
+    if (len == 1)
+        sum += *(uint8_t *)p;
+
+    sum  = (sum >> 16) + (sum & 0xFFFF);
+    sum += (sum >> 16);
+    return (uint16_t)(~sum);
+}
+
+/* 打印详细 Ping 时序（用于调试） */
+void ping_timing_report(uint32_t t_start_us, uint32_t t_end_us,
+                        uint8_t seq, int success)
+{
+    uint32_t rtt_us = t_end_us - t_start_us;
+    float    rtt_ms = rtt_us / 1000.0f;
+
+    printf("[PING] seq=%d ", seq);
+    if (success) {
+        printf("RTT = %.3f ms (%.0f us)\n", rtt_ms, (float)rtt_us);
+        if (rtt_us < 500)
+            printf("       >> 同网段直连，信号质量佳\n");
+        else if (rtt_us < 5000)
+            printf("       >> 可能有交换机跳转或轻微拥塞\n");
+        else
+            printf("       >> RTT 偏高，检查链路质量!\n");
+    } else {
+        printf("TIMEOUT (>1000ms)\n");
+    }
+}
+
+/* 简化版 RTT 测量（基于 SysTick） */
+uint32_t ping_send_and_measure(uint32_t target_ip, uint8_t seq)
+{
+    uint32_t t_send = get_systick_us();
+
+    icmp_send_request(target_ip, seq);
+    /* 等待应答（实际应用中应有超时机制） */
+    icmp_wait_reply(target_ip, seq, 1000);
+
+    uint32_t t_recv = get_systick_us();
+    return t_recv - t_send;    /* 返回 RTT（微秒） */
+}
+```
+
+---
+
+### E.4 TCP 三次握手时序（TCP Three-Way Handshake）
+
+TCP 是面向连接的协议，通信前必须通过三次握手建立连接。理解握手机制对调试 TCP 连接问题至关重要——很多"连接不上"问题都出在握手阶段。
+
+```
+  主动打开（Client）                       被动打开（Server）
+  端口：任意（如 12345）                     端口：已知（如 80）
+       │                                          │
+       │  === 状态：CLOSED ===                     │  === 状态：LISTEN ===
+       │                                          │
+       │    --- 第 1 步：SYN --->                  │
+       │    Flags: SYN=1, ACK=0                    │
+       │    seq=1000         (初始序列号 ISN=C)    │
+       │    MSS=1460, Window=65535                 │
+       │    SACK Permitted, Timestamp              │
+       │─────────────────────────────────────────> │  === 状态：SYN_RCVD ===
+       │                                          │
+       │    <--- 第 2 步：SYN+ACK ---              │
+       │    Flags: SYN=1, ACK=1                    │
+       │    seq=2000         (初始序列号 ISN=S)    │
+       │    ack=1001  (期待收到的下一个字节)        │
+       │    MSS=1460, Window=65535                 │
+       │<───────────────────────────────────────── │
+       │                                          │
+       │  === 状态：ESTABLISHED ===                │
+       │                                          │
+       │    --- 第 3 步：ACK --->                  │
+       │    Flags: SYN=0, ACK=1                    │
+       │    seq=1001, ack=2001                     │
+       │    （可捎带数据，此步之后才能发送应用数据） │
+       │─────────────────────────────────────────> │  === 状态：ESTABLISHED ===
+       │                                          │
+       │    === 数据传输阶段 ===                    │
+       │    Client -> Server: seq=1001, len=100    │
+       │    Server -> Client: ack=1101             │
+       │    Server -> Client: seq=2001, len=200    │
+       │    Client -> Server: ack=2201             │
+       │                                          │
+       │    === 四次挥手关闭（FIN 交换）===         │
+```
+
+**握手时序参数详细说明**：
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+
+/* TCP 头部头部结构 */
+typedef struct __attribute__((packed)) {
+    uint16_t src_port;
+    uint16_t dst_port;
+    uint32_t seq_num;
+    uint32_t ack_num;
+    uint8_t  data_offset;   /* 高 4 位: 头部长度(×4) */
+    uint8_t  flags;         /* URG|ACK|PSH|RST|SYN|FIN */
+    uint16_t window;
+    uint16_t checksum;
+    uint16_t urgent_ptr;
+} tcp_header_t;
+
+/* TCP 标志位定义 */
+#define TCP_FLAG_FIN  0x01
+#define TCP_FLAG_SYN  0x02
+#define TCP_FLAG_RST  0x04
+#define TCP_FLAG_PSH  0x08
+#define TCP_FLAG_ACK  0x10
+#define TCP_FLAG_URG  0x20
+
+/* 打印三次握手详细时序 */
+void tcp_handshake_dump(uint32_t t_syn, uint32_t t_synack,
+                        uint32_t t_ack, uint32_t rtt)
+{
+    printf("=== TCP Three-Way Handshake Timing ===\n");
+    printf("  T(SYN):     t = %u us\n", t_syn);
+    printf("  T(SYN+ACK): t = %u us  (delta = %u us)\n",
+           t_synack, t_synack - t_syn);
+    printf("  T(ACK):     t = %u us  (delta = %u us)\n",
+           t_ack, t_ack - t_synack);
+    printf("  RTT:        %u us = %.2f ms\n", rtt, rtt / 1000.0f);
+
+    if (rtt > 100000)
+        printf("  *** 警告：RTT > 100ms，可能存在 WAN 延迟\n");
+    if ((t_synack - t_syn) > 50000)
+        printf("  *** 警告：Server 响应时间 > 50ms，Server 可能过载\n");
+}
+
+/* TCP 连接超时（典型嵌入式中断/轮询实现） */
+#define TCP_SYN_TIMEOUT_MS  3000   /* 3 秒超时（RFC 6298） */
+#define TCP_SYN_RETRIES     3
+
+int tcp_connect_with_retry(uint32_t server_ip, uint16_t port)
+{
+    for (int retry = 0; retry < TCP_SYN_RETRIES; retry++)
+    {
+        /* 发送 SYN */
+        tcp_send_syn(server_ip, port, get_isn());
+        uint32_t timeout = get_tick_ms() + TCP_SYN_TIMEOUT_MS;
+
+        while (get_tick_ms() < timeout)
+        {
+            if (tcp_has_synack(server_ip, port))
+            {
+                tcp_send_ack(server_ip, port);
+                printf("TCP connected after %d retries\n", retry);
+                return 1;   /* 成功 */
+            }
+            process_network_events();
+        }
+        printf("TCP SYN timeout (retry %d/%d)\n",
+               retry + 1, TCP_SYN_RETRIES);
+    }
+    return 0;   /* 连接失败 */
+}
+```
+
+**为什么是三次而不是两次**：
+- 防止已失效的 SYN 请求在 Server 端建立"半开连接"（两次握手无法消除）
+- 两次握手可能导致 Server 资源在收到 SYN 时即分配，而 Client 可能并未真正准备好通信
+- 第三次 ACK 是 Client 对 Server ISN 的确认——如果没有这步，Server 无法确认 Client 收到了自己的 SYN+ACK
+
+**常见的握手失败根因**：
+- **SYN 无响应**：防火墙/ACL 过滤，或目标端口未开放（无 LISTEN 服务）
+- **RST 响应**：目标端口有服务，但 SYN 中包含不受支持的选项（如 MSS 过小）
+- **SYN+ACK 丢失**：对称 NAT 或 IP 欺骗防护拦截了非对称路由的回复包
+
+---
+
+### E.5 MDIO Clause 22 读操作时序（MDIO Read Timing with Measurements）
+
+MDIO（Management Data Input/Output）是 IEEE 802.3 定义的 MAC 与 PHY 之间的管理接口。Clause 22 帧格式包含前导码、起始位、操作码、PHY 地址、寄存器地址、转向状态和数据字段。
+
+```
+MDC 时钟（2.5MHz 典型，最大可配置）：
+                         +---+   +---+   +---+   +---+   +---+   +---+   +---+
+                         |   |   |   |   |   |   |   |   |   |   |   |   |   |
+                  -------+   +---+   +---+   +---+   +---+   +---+   +---+   +---+
+
+MDIO 数据线（双向，需要上拉电阻）：
+读操作帧格式（32 个 MDC 周期）：
+
+        preamble (32个1)      ST   OP     PHYAD     REGAD      TA       DATA (读)
+        ─────────────        ──   ──   ────────   ────────   ────   ────────────
+MDIO: 111111111111111111...  01   10   AAAAAPPPP   RRRRR       Z0     DDDDDDDDDDDDDDDD
+       ↑                     ↑    ↑    ↑           ↑           ↑      ↑
+       32 个逻辑"1"           01 为起始  10=读操作   5位 PHY 地址  5位寄存器地址  Z=高阻,0=驱动 16 位数据
+       用于同步                                                                 由 PHY 驱动
+
+时序图（详细每周期标注）：
+                                                                                    
+MDC  ──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──┬──
+       │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │  │
+       └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──┘  └──
+       ├── 前导码 (32bit) ──┤├ST├OP├── PHYAD ──├── REGAD ──├┤TA├───── DATA (16bit) ─────┤
+       ↑                   ↑                    ↑                          ↑
+       MDC 周期 1          周期 33              周期 38                    周期 48-63
+       MAC 驱动 MDIO       MAC 驱动              MAC 驱动                   PHY 驱动 MDIO
+```
+
+**MDC 频率与周期关系**：
+
+| MDC 频率 | 周期 | 单次读操作时间 | 说明 |
+|----------|------|----------------|------|
+| 2.5 MHz（标准） | 400 ns | 64 × 400ns = 25.6 μs | Clause 22 最大频率 |
+| 1.0 MHz | 1000 ns | 64 μs | 兼容性最佳 |
+| 500 KHz | 2000 ns | 128 μs | 长布线场景 |
+| 12.5 MHz | 80 ns | 5.12 μs | Clause 45 支持更高速率 |
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+
+/* 位操作宏 */
+#define MDIO_READ   0x02   /* OP=10 (二进制) */
+#define MDIO_WRITE  0x01   /* OP=01 (二进制) */
+
+/* GPIO 操作抽象（平台相关，此处为示例） */
+extern void mdio_set_mdc(int level);
+extern void mdio_set_mdio(int level);
+extern int  mdio_get_mdio(void);
+
+/* 软件模拟 MDIO Clause 22 读操作 */
+uint16_t mdio_read_clause22(uint8_t phy_addr, uint8_t reg_addr)
+{
+    uint16_t data = 0;
+    int i;
+
+    /* 1. 前导码：32 个连续"1" */
+    for (i = 0; i < 32; i++) {
+        mdio_set_mdio(1);
+        mdio_set_mdc(1);  mdio_set_mdc(0);  /* MDC 上升沿采样 */
+    }
+
+    /* 2. 起始位 (ST=01) */
+    mdio_set_mdio(0);  mdio_set_mdc(1);  mdio_set_mdc(0);
+    mdio_set_mdio(1);  mdio_set_mdc(1);  mdio_set_mdc(0);
+
+    /* 3. 操作码 (OP=10 = 读) */
+    mdio_set_mdio(1);  mdio_set_mdc(1);  mdio_set_mdc(0);
+    mdio_set_mdio(0);  mdio_set_mdc(1);  mdio_set_mdc(0);
+
+    /* 4. PHY 地址 (5-bit, MSB first) */
+    for (i = 4; i >= 0; i--) {
+        mdio_set_mdio((phy_addr >> i) & 1);
+        mdio_set_mdc(1);  mdio_set_mdc(0);
+    }
+
+    /* 5. 寄存器地址 (5-bit, MSB first) */
+    for (i = 4; i >= 0; i--) {
+        mdio_set_mdio((reg_addr >> i) & 1);
+        mdio_set_mdc(1);  mdio_set_mdc(0);
+    }
+
+    /* 6. 转向状态 (TA)：MAC 释放总线(Z)，PHY 驱动第 2 个周期为 0 */
+    mdio_set_mdio(1);  mdio_set_mdc(1);  mdio_set_mdc(0);  /* Z 状态 */
+    mdio_set_mdio(0);  mdio_set_mdc(1);  mdio_set_mdc(0);  /* PHY 驱动为 0 */
+
+    /* 7. 数据 (16-bit, MSB first), PHY 驱动 */
+    for (i = 15; i >= 0; i--) {
+        mdio_set_mdc(1);
+        data |= (mdio_get_mdio() << i);
+        mdio_set_mdc(0);
+    }
+
+    return data;
+}
+
+/* 测量 MDIO 读操作耗时 */
+void mdio_benchmark_read(uint8_t phy_addr, uint8_t reg_addr, int iterations)
+{
+    uint32_t t_start = get_systick_us();
+
+    for (int i = 0; i < iterations; i++)
+        mdio_read_clause22(phy_addr, reg_addr);
+
+    uint32_t t_end   = get_systick_us();
+    float    avg_us  = (float)(t_end - t_start) / iterations;
+
+    printf("MDIO Read Benchmark (%d iterations):\n", iterations);
+    printf("  Total: %u us\n",   t_end - t_start);
+    printf("  Avg:   %.2f us\n", avg_us);
+    printf("  Rate:  %.0f reads/sec\n", 1000000.0f / avg_us);
+}
+
+/* 时序验证：测量 MDC 周期是否符合预期 */
+void mdio_verify_timing(void)
+{
+    uint32_t t1 = get_systick_ns();    /* 高精度计时器 */
+    mdio_set_mdc(1);
+    uint32_t t2 = get_systick_ns();
+    mdio_set_mdc(0);
+    uint32_t t3 = get_systick_ns();
+
+    printf("MDC high time: %u ns  (应 > 160ns @ 2.5MHz)\n", t2 - t1);
+    printf("MDC low time:  %u ns  (应 > 160ns @ 2.5MHz)\n", t3 - t2);
+    printf("MDC period:    %u ns  (应为 400ns @ 2.5MHz)\n", t3 - t1);
+}
+```
+
+---
+
+### E.6 自动协商 FLP Burst 时序（Auto-Negotiation FLP Burst Timing）
+
+自动协商使用 FLP（Fast Link Pulse）Burst 在 PHY 之间交换能力信息。每个 FLP Burst 包含 17 个时钟脉冲和最多 16 个数据脉冲，持续约 2ms，随后间隔约 16ms 发送下一个 Burst。
+
+```
+       FLP Burst #1                     Idle (~16ms)              FLP Burst #2
+   ┌──────────────────────┐    ├──────────────────────┤    ┌──────────────────────┐
+   │    17 clock +        │    │     Link 空闲          │    │    17 clock +        │
+   │    16 data pulses    │    │    无脉冲传输          │    │    16 data pulses    │
+   │                      │    │                        │    │                      │
+   │ ┌─┐ ┌─┐ ┌─┐ ┌─┐    │    │                        │    │ ┌─┐ ┌─┐ ┌─┐ ┌─┐    │
+   │ │ │ │ │ │ │ │ │ │...│    │                        │    │ │ │ │ │ │ │ │ │ │...│
+   │─┘ └─┘ └─┘ └─┘ └─┘  └────│────────────────────────│────┘ └─┘ └─┘ └─┘ └─┘  └──
+   ├── 约 2ms ──┤             ├── 16ms ± 8ms ──────────┤   ├── 约 2ms ──┤
+   ↑                         ↑                         ↑
+   链接建立后，PHY 持续发送    第一个 Burst 包含         第二个 Burst 继续
+   第一个 FLP Burst           Base Page (能力声明)      交换能力或发送 Next Page
+
+单个脉冲的细节（100BASE-TX）：
+        ┌───────┐                    
+        │       │  100ns 宽脉冲（正脉冲）               
+        │       │                    
+   ─────┘       └─────────────────────────────
+   ↑           ↑
+   脉冲开始     脉冲结束
+   宽度: 100ns ± 15ns（IEEE 802.3 规范）
+```
+
+**FLP Burst 时序参数表**：
+
+| 参数 | 最小值 | 典型值 | 最大值 | 单位 |
+|------|--------|--------|--------|------|
+| Burst 长度 | 1.4 | 2.0 | 2.8 | ms |
+| Burst 间隔 | 5.0 | 16.0 | 24.0 | ms |
+| 时钟脉冲宽度 | 85 | 100 | 115 | ns |
+| 数据脉冲宽度 | 85 | 100 | 115 | ns |
+| 脉冲间距 | 55 | 62.5 | 70 | μs |
+| 完整协商时间 | — | 0.5-3 | 6 | s |
+
+**Base Page 位域定义**：
+
+```
+Base Page (16-bit, 通过 FLP Burst 的 16 个数据脉冲传输):
+┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+│ D15│ D14│ D13│ D12│ D11│ D10│ D9 │ D8 │ D7 │ D6 │ D5 │ D4 │ D3 │ D2 │ D1 │ D0 │
+├────┼────┼────┼────┼────┼────┼────┼────┼────┼────┼────┼────┼────┼────┼────┼────┤
+│ S1 │ S0 │ E5 │ E4 │ E3 │ E2 │ E1 │ E0 │FD  │HD  │PS1 │PS0 │ T4 │ RF │ Ack│ NP │
+└────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+  │    │    │    │    │    │    │    │    │    │    │    │    │    │    │    │
+  └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────
+  Selector Field       Technology Ability         100BTX FD  100BTX HD   远程故障  确认 下一页
+  S1:S0 = 0b01         E[5:0] 位图声明能力        PS1:PS0 = 10          T4 = 1      = 1 支持
+  (IEEE 802.3)        (D8=1=100BASE-T4)           (100BASE-TX FD)      (表示支持)
+```
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+
+/* Base Page 位域定义 */
+#define AN_NP     (1 << 15)   /* Next Page 指示 */
+#define AN_ACK    (1 << 14)   /* 确认收到对方能力 */
+#define AN_RF     (1 << 13)   /* 远程故障 */
+#define AN_T4     (1 << 12)   /* 100BASE-T4 支持 */
+#define AN_PS_MASK (0x03 << 10) /* 端口类型 */
+#define AN_100TX_FD (0x02 << 10) /* 100BASE-TX 全双工 */
+#define AN_100TX_HD (0x01 << 10) /* 100BASE-TX 半双工 */
+#define AN_10T_FD  (1 << 9)   /* 10BASE-T 全双工 */
+#define AN_10T_HD  (1 << 8)   /* 10BASE-T 半双工 */
+
+/* 计算自动协商超时时间 */
+uint32_t aneg_timeout_ms(uint8_t num_pages, int remote_fault)
+{
+    /* 每个 FLP Burst 约 2ms + 16ms 间隔 = 18ms/轮 */
+    /* Base Page 交换需要 3 轮（发送、应答、确认） */
+    uint32_t time_ms = 3000;         /* 基础等待 3 秒 */
+
+    if (num_pages > 1)
+        time_ms += num_pages * 500;  /* Next Page 每页加 500ms */
+
+    if (remote_fault)
+        time_ms += 2000;             /* 远程故障处理加 2 秒 */
+
+    return time_ms;
+}
+
+/* 解析协商结果并打印 */
+void aneg_result_dump(uint16_t local_ability, uint16_t peer_ability,
+                      uint16_t negotiated)
+{
+    printf("=== Auto-Negotiation Result ===\n");
+    printf("Local:  0x%04X\n", local_ability);
+    printf("Peer:   0x%04X\n", peer_ability);
+    printf("Result: 0x%04X\n", negotiated);
+
+    printf("\nNegotiated Speed/Duplex: ");
+    if (negotiated & AN_100TX_FD)
+        printf("100BASE-TX Full Duplex\n");
+    else if (negotiated & AN_100TX_HD)
+        printf("100BASE-TX Half Duplex\n");
+    else if (negotiated & AN_10T_FD)
+        printf("10BASE-T Full Duplex\n");
+    else if (negotiated & AN_10T_HD)
+        printf("10BASE-T Half Duplex\n");
+    else
+        printf("UNKNOWN (fallback to 10T-HD)\n");
+
+    int local_highest = 0, peer_highest = 0;
+    uint32_t priorities[] = {AN_100TX_FD, AN_100TX_HD, AN_10T_FD, AN_10T_HD};
+
+    for (int i = 0; i < 4; i++) {
+        if (local_ability & priorities[i] && !local_highest)
+            local_highest = priorities[i];
+        if (peer_ability & priorities[i] && !peer_highest)
+            peer_highest = priorities[i];
+    }
+    printf("Local best:  0x%04X\n", local_highest);
+    printf("Peer best:   0x%04X\n", peer_highest);
+}
+
+/* FLP Burst 超时检测（用于调试自动协商问题） */
+int aneg_wait_complete(uint32_t timeout_ms)
+{
+    uint32_t t_start = get_tick_ms();
+
+    printf("Waiting for ANEG complete...\n");
+    while (get_tick_ms() - t_start < timeout_ms)
+    {
+        int status = phy_read_aneg_status();
+
+        if (status == 1) {   /* 协商完成 */
+            uint32_t elapsed = get_tick_ms() - t_start;
+            printf("ANEG complete after %u ms\n", elapsed);
+            return 1;
+        }
+        if (status == -1) {  /* 协商失败 */
+            printf("ANEG failed!\n");
+            return -1;
+        }
+        delay_ms(10);        /* 每 10ms 轮询一次 */
+    }
+
+    printf("ANEG timeout after %u ms!\n", timeout_ms);
+    return 0;
+}
+```
+
+---
+
+### E.7 自动协商优先级裁决（Auto-Negotiation Priority Resolution）
+
+当两端 PHY 支持多种速率/双工模式组合时，自动协商的优先级裁决算法保证选择双方都支持的"最优"模式。裁决规则遵循 IEEE 802.3 定义的优先级表。
+
+```
+  本地 PHY 能力                       对端 PHY 能力
+  (PC 侧)                              (交换机侧)
+      │                                      │
+      │  100BASE-TX Full Duplex   ✓           │  100BASE-TX Full Duplex   ✓
+      │  100BASE-TX Half Duplex   ✓           │  100BASE-TX Half Duplex   ✓
+      │  10BASE-T Full Duplex     ✓           │  10BASE-T Full Duplex     ✓
+      │  10BASE-T Half Duplex     ✓           │  10BASE-T Half Duplex     ✓
+      │                                      │
+      └─────────────── 交换能力 ──────────────┘
+                              │
+                     Priority Resolution
+                     (双方按相同算法独立计算)
+                              │
+                              ▼
+                    ┌─────────────────────┐
+                    │  共同支持的能力集    │
+                    │                     │
+                    │  100TX-FD  ← 优先级 1│ ← 最高优先级
+                    │  100TX-HD      优先级 2│
+                    │  10T-FD        优先级 3│
+                    │  10T-HD        优先级 4│ ← 最低优先级
+                    │                     │
+                    │  取最高优先级的交集  │
+                    │  = 100BASE-TX FD    │
+                    └─────────────────────┘
+
+  优先级裁决算法（双方独立执行，结果一致）：
+
+  1. 本地启动 Base Page 交换（发送本端能力位图）
+  2. 等待对方完成 ACK（Ack 位置 1）
+  3. 列表如下优先级（从高到低）：
+
+     优先级 | 能力
+     ───────┼──────────────────
+       1    | 100BASE-T2 FD
+       2    | 100BASE-T2 HD
+       3    | 100BASE-TX FD
+       4    | 100BASE-T4
+       5    | 100BASE-TX HD
+       6    | 10BASE-T FD
+       7    | 10BASE-T HD
+
+  4. 如果无共同能力 → 协商失败，Link Down
+  5. 如果只有一方声明 HD → 即使另一方支持 FD，也降级为 HD
+```
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+
+/* IEEE 802.3 优先级表（索引从 0=最高到 6=最低） */
+static const uint16_t aneg_priority_table[] = {
+    (0 << 10) | (0 << 9) | (0 << 8) | 0x0020,  /* 100BASE-T2 FD  */
+    (0 << 10) | (0 << 9) | (0 << 8) | 0x0010,  /* 100BASE-T2 HD  */
+    AN_100TX_FD,                                 /* 100BASE-TX FD  */
+    AN_T4,                                       /* 100BASE-T4     */
+    AN_100TX_HD,                                 /* 100BASE-TX HD  */
+    AN_10T_FD,                                   /* 10BASE-T FD    */
+    AN_10T_HD,                                   /* 10BASE-T HD    */
+};
+
+/* 自动协商优先级裁决函数 */
+uint16_t aneg_resolve(uint16_t local_ability, uint16_t peer_ability)
+{
+    printf("=== Auto-Negotiation Priority Resolution ===\n");
+    printf("  Local:  0x%04X\n", local_ability);
+    printf("  Peer:   0x%04X\n", peer_ability);
+
+    for (int priority = 0; priority < 7; priority++)
+    {
+        uint16_t tech = aneg_priority_table[priority];
+
+        if ((local_ability & tech) && (peer_ability & tech))
+        {
+            printf("  >> Match at priority %d: 0x%04X\n", priority + 1, tech);
+
+            /* 特殊情况：如果一方声明 HD 而对方声明 FD，降级为 HD */
+            if ((tech == AN_100TX_FD || tech == AN_10T_FD) &&
+                !(local_ability & tech) != !(peer_ability & tech))
+            {
+                /* 不应该到达这里——优先级表中 FD 高于 HD */
+                /* 但如果协商双方能力集不完整，需额外处理 */
+            }
+
+            return tech;
+        }
+    }
+
+    printf("  >> No common technology! Negotiation FAILED.\n");
+    return 0;   /* 协商失败 */
+}
+
+/* 显示完整协商诊断信息 */
+void aneg_diagnostic(uint8_t phy_addr)
+{
+    printf("\n========== ANEG Diagnostic ==========\n");
+
+    /* 读取 ANEG 状态寄存器（Clause 22, Reg 0x01 的 bit 5 和 bit 6） */
+    uint16_t bmsr = mdio_read_clause22(phy_addr, 0x01);
+    uint16_t lpa  = mdio_read_clause22(phy_addr, 0x05);  /* Link Partner Ability */
+
+    int autoneg_complete = (bmsr >> 5) & 1;
+    int link_up          = (bmsr >> 2) & 1;
+    int partner_ack      = (lpa  >> 14) & 1;  /* 对端 ACK */
+
+    printf("  PHY Addr:    0x%02X\n", phy_addr);
+    printf("  Autoneg:     %s\n",     autoneg_complete ? "COMPLETE" : "IN PROGRESS/FAILED");
+    printf("  Link Status: %s\n",     link_up ? "UP" : "DOWN");
+    printf("  Partner ACK: %s\n",     partner_ack ? "YES" : "NO");
+
+    if (!link_up)
+    {
+        printf("\n  *** Link DOWN 可能原因：\n");
+        printf("      1. 网线未连接或损坏\n");
+        printf("      2. 对端未上电或端口禁用\n");
+        printf("      3. PHY 地址配置错误\n");
+        printf("      4. 自动协商不匹配（强制设置速率>对端不支持）\n");
+        printf("      5. MDI/MDIX 交叉问题（现代 PHY 通常自动翻转）\n");
+    }
+    else if (!partner_ack)
+    {
+        printf("\n  *** 对端未 ACK 自动协商，仍在交换能力中...\n");
+    }
+}
+
+/* 模拟自动协商过程（纯软件演示） */
+void aneg_simulate(void)
+{
+    printf("\n=== Auto-Negotiation Simulation ===\n\n");
+
+    /* 定义典型场景 */
+    typedef struct {
+        char *desc;
+        uint16_t local;
+        uint16_t peer;
+    } aneg_scenario_t;
+
+    aneg_scenario_t scenarios[] = {
+        {"PC(100TX-FD) <-> Switch(100TX-FD+HD)", AN_100TX_FD | AN_100TX_HD | AN_10T_FD | AN_10T_HD,
+                                                   AN_100TX_FD | AN_100TX_HD | AN_10T_FD | AN_10T_HD},
+        {"PC(100TX-HD) <-> Switch(100TX-FD)",     AN_100TX_HD | AN_10T_HD,
+                                                   AN_100TX_FD | AN_100TX_HD | AN_10T_FD | AN_10T_HD},
+        {"PC(10T-HD)   <-> Switch(100TX-FD)",     AN_10T_HD,
+                                                   AN_100TX_FD},
+        {"PC(100TX-FD) <-> Switch(100TX-FD)",     AN_100TX_FD | AN_100TX_HD,
+                                                   AN_100TX_FD | AN_100TX_HD},
+    };
+
+    for (int i = 0; i < 4; i++) {
+        printf("Scenario %d: %s\n", i + 1, scenarios[i].desc);
+        uint16_t result = aneg_resolve(scenarios[i].local, scenarios[i].peer);
+        printf("  --> ");
+        if (result & AN_100TX_FD) printf("100BASE-TX FD\n");
+        else if (result & AN_100TX_HD) printf("100BASE-TX HD\n");
+        else if (result & AN_10T_FD) printf("10BASE-T FD\n");
+        else if (result & AN_10T_HD) printf("10BASE-T HD\n");
+        else printf("FAILED (no common mode)\n");
+        printf("\n");
+    }
+}
+```
+
+---
+
+### E.8 时序综合测量工具（Timing Measurement Utility）
+
+以下代码提供了一个通用的时序测量和调试输出工具，可用于验证上述所有协议的时序表现：
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+
+/* ======================== 时序测量工具 ======================== */
+
+/* 高精度计时器抽象（需根据平台实现） */
+#if defined(__ARM_ARCH_7M__) || defined(__ARM_ARCH_7EM__)
+    /* Cortex-M3/M4/M7：使用 DWT 周期计数器 */
+    static inline uint32_t timer_get_us(void)
+    {
+        extern uint32_t SystemCoreClock;
+        static uint32_t dwt_cycles_per_us = 0;
+        if (!dwt_cycles_per_us) {
+            dwt_cycles_per_us = SystemCoreClock / 1000000;
+            CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+            DWT->CYCCNT = 0;
+            DWT->CTRL  |= DWT_CTRL_CYCCNTENA_Msk;
+        }
+        return DWT->CYCCNT / dwt_cycles_per_us;
+    }
+#else
+    /* 通用 fallback：使用标准库时钟 */
+    #include <time.h>
+    static inline uint32_t timer_get_us(void)
+    {
+        return (uint32_t)(clock() * 1000000 / CLOCKS_PER_SEC);
+    }
+#endif
+
+/* 时序统计结构 */
+typedef struct {
+    uint32_t min_us;      /* 最短耗时 */
+    uint32_t max_us;      /* 最长耗时 */
+    uint32_t total_us;    /* 累计耗时 */
+    uint32_t count;       /* 采样次数 */
+    char     label[32];   /* 测量标签 */
+} timing_stats_t;
+
+/* 初始化时序统计 */
+void timing_stats_init(timing_stats_t *stats, const char *label)
+{
+    stats->min_us   = 0xFFFFFFFF;
+    stats->max_us   = 0;
+    stats->total_us = 0;
+    stats->count    = 0;
+    snprintf(stats->label, sizeof(stats->label), "%s", label);
+}
+
+/* 记录一次测量 */
+void timing_stats_record(timing_stats_t *stats, uint32_t elapsed_us)
+{
+    if (elapsed_us < stats->min_us) stats->min_us = elapsed_us;
+    if (elapsed_us > stats->max_us) stats->max_us = elapsed_us;
+    stats->total_us += elapsed_us;
+    stats->count++;
+}
+
+/* 打印统计报告 */
+void timing_stats_report(timing_stats_t *stats)
+{
+    float avg_us = stats->count ?
+                   (float)stats->total_us / stats->count : 0;
+
+    printf("=== Timing: %s ===\n", stats->label);
+    printf("  Samples: %u\n",  stats->count);
+    printf("  Min:     %u us (%.3f ms)\n",
+           stats->min_us, stats->min_us / 1000.0f);
+    printf("  Avg:     %.1f us (%.3f ms)\n",
+           avg_us, avg_us / 1000.0f);
+    printf("  Max:     %u us (%.3f ms)\n",
+           stats->max_us, stats->max_us / 1000.0f);
+    printf("  Rate:    %.0f ops/sec\n",
+           1000000.0f / (avg_us > 0 ? avg_us : 1));
+}
+
+/* ================ 以太网时序综合测试 ================ */
+
+void ethernet_timing_test(void)
+{
+    timing_stats_t arp_stats, icmp_stats, mdio_stats, tcp_stats;
+
+    timing_stats_init(&arp_stats,  "ARP Request-Reply");
+    timing_stats_init(&icmp_stats, "ICMP Ping Echo");
+    timing_stats_init(&mdio_stats, "MDIO Register Read");
+    timing_stats_init(&tcp_stats,  "TCP Connect (3-way handshake)");
+
+    printf("\n========== Ethernet Timing Test Suite ==========\n");
+    printf("Note: Results depend on link speed and CPU load.\n\n");
+
+    /* 测试 ARP */
+    for (int i = 0; i < 5; i++) {
+        uint32_t t1 = timer_get_us();
+        arp_resolve(0xC0A80102);    /* 192.168.1.2 */
+        uint32_t t2 = timer_get_us();
+        timing_stats_record(&arp_stats, t2 - t1);
+    }
+    timing_stats_report(&arp_stats);
+
+    /* 测试 ICMP Ping */
+    for (int i = 0; i < 5; i++) {
+        uint32_t t1 = timer_get_us();
+        ping_send(0xC0A80102);      /* 192.168.1.2 */
+        ping_wait_reply(1000);
+        uint32_t t2 = timer_get_us();
+        timing_stats_record(&icmp_stats, t2 - t1);
+    }
+    timing_stats_report(&icmp_stats);
+
+    /* 测试 MDIO 读 */
+    for (int i = 0; i < 100; i++) {
+        uint32_t t1 = timer_get_us();
+        mdio_read_clause22(0x01, 0x01);   /* PHY addr=1, BMSR reg */
+        uint32_t t2 = timer_get_us();
+        timing_stats_record(&mdio_stats, t2 - t1);
+    }
+    timing_stats_report(&mdio_stats);
+
+    printf("\n========== Test Complete ==========\n");
+}
+```
+
+> **使用建议**：
+> 1. 在 main loop 或 RTOS 任务中运行 `ethernet_timing_test()`，可快速了解当前平台的时序基线
+> 2. 将 `timing_stats_t` 集成到网络协议栈的各个关键路径（发送、接收、中断处理等）
+> 3. 对比不同优化级别（-O0 vs -O2）下的时序差异，定位性能瓶颈
+> 4. 当 MCU 主频或以太网速率变更时，重新运行测试以验证时序是否仍满足协议要求
+
+---
+
 ## 参考资源
