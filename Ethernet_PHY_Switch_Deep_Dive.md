@@ -2577,6 +2577,1439 @@ void cli_phy_cmd(int argc, char **argv) {
 
 ---
 
+## 附录 C: Beginner Learning Path for Ethernet PHY
+
+### C.1 前置知识清单 (Prerequisites Checklist)
+
+在开始学习 Ethernet PHY 驱动开发之前，请确保你已掌握以下基础知识：
+
+| 编号 | 知识点 | 要求 | 自学建议 |
+|------|--------|------|----------|
+| 1 | **数字逻辑基础** | 理解寄存器、位操作、三态门、上拉/下拉电阻 | 复习"数字电路"前四章即可 |
+| 2 | **C 语言位运算** | 熟练使用 `& \| ~ << >>`，能读写寄存器的特定位 | 练习: 写一个函数，将 uint16 变量的 bit3-bit0 设为 0b1010 |
+| 3 | **MCU GPIO 编程** | 会配置 GPIO 输入/输出/推挽/开漏，会写 `HAL_GPIO_WritePin` | 在 STM32 上点个 LED 就算过关 |
+| 4 | **MCU 定时器/延时** | 会使用 `HAL_Delay` 或自己实现 `delay_us` | 裸机编程基础，无难度 |
+| 5 | **I2C/SPI 协议常识** | 理解时钟线、数据线、主从设备概念（MDIO 类似但更简单） | 不需精通，懂概念即可 |
+| 6 | **串口 printf 调试** | 会用串口输出调试信息（非常重要！） | STM32CubeIDE 新建工程即可 |
+| 7 | **Ethernet 基本概念** | 知道 MAC 地址、网线、交换机是什么 | 读一遍 Wikipedia "Ethernet" 条目 |
+
+**自测题**：如果以下代码你能看懂每一行的作用，前置知识已经具备：
+
+```c
+uint16_t reg_val;
+// 读取 PHY 寄存器 0x01
+phy_read(phy_addr, 0x01, &reg_val);
+// 检查 bit2 (Link Status)
+if (reg_val & (1 << 2)) {
+    printf("Link is UP\n");
+} else {
+    printf("Link is DOWN\n");
+}
+// 清除 bit2 以外的位，将结果写入寄存器 0x00
+reg_val &= ~(1 << 15);  // 清除 bit15 (Reset)
+reg_val |= (1 << 12);   // 设置 bit12 (Auto-Neg Enable)
+phy_write(phy_addr, 0x00, reg_val);
+```
+
+如果以上有不明白的地方，请先补足基础知识再继续。
+
+---
+
+### C.2 7 天实战入门路线图 (7-Day Hands-On Learning Roadmap)
+
+#### 第 1 天：Hello PHY -- 读取芯片 ID
+
+**目标**：实现第一次 MDIO 通信，读取 PHY ID 寄存器，验证硬件连接是否正确。
+
+**硬件准备**：
+- STM32F407 开发板 (或任意带 GPIO 的 MCU)
+- LAN8720A 模块
+- 4 根杜邦线连接 MDIO/MDC/3.3V/GND
+
+**接线**：
+```
+STM32F407          LAN8720A 模块
+PA1  (MDC)   ----> MDC 引脚
+PA2  (MDIO)  <---> MDIO 引脚
+3.3V         ----> VCC
+GND          ----> GND
+```
+
+**完整代码**：
+
+```c
+#include "stm32f4xx_hal.h"
+#include <stdio.h>
+
+// 引脚定义
+#define MDC_PORT    GPIOA
+#define MDC_PIN     GPIO_PIN_1
+#define MDIO_PORT   GPIOA
+#define MDIO_PIN    GPIO_PIN_2
+
+// MDIO 时钟延迟 (1MHz)
+#define MDIO_DELAY() delay_us(1)
+
+// 延时函数 (粗略延时)
+static void delay_us(uint32_t us) {
+    // STM32F407 @168MHz, 约 168 个循环 = 1us
+    for (uint32_t i = 0; i < us * 168; i++) {
+        __NOP();
+    }
+}
+
+static void delay_ms(uint32_t ms) {
+    HAL_Delay(ms);
+}
+
+// 初始化 PHY 用的 GPIO
+static void phy_gpio_init(void) {
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    // MDC: 推挽输出
+    gpio.Pin = MDC_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(MDC_PORT, &gpio);
+    HAL_GPIO_WritePin(MDC_PORT, MDC_PIN, GPIO_PIN_RESET);
+
+    // MDIO: 开漏输出 (需要外部上拉电阻 1.5k-2.2k 到 3.3V)
+    gpio.Pin = MDIO_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(MDIO_PORT, &gpio);
+    HAL_GPIO_WritePin(MDIO_PORT, MDIO_PIN, GPIO_PIN_SET);
+}
+
+// MDIO 为输出模式
+static void mdio_set_output(void) {
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = MDIO_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_OD;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(MDIO_PORT, &gpio);
+}
+
+// MDIO 为输入模式
+static void mdio_set_input(void) {
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = MDIO_PIN;
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL;  // 外部已有上拉
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(MDIO_PORT, &gpio);
+}
+
+// MDC 时钟脉冲
+static void mdc_toggle(void) {
+    HAL_GPIO_WritePin(MDC_PORT, MDC_PIN, GPIO_PIN_SET);
+    MDIO_DELAY();
+    HAL_GPIO_WritePin(MDC_PORT, MDC_PIN, GPIO_PIN_RESET);
+    MDIO_DELAY();
+}
+
+// Clause 22 MDIO 读操作
+static uint16_t mdio_read(uint8_t phy_addr, uint8_t reg_addr) {
+    uint32_t frame;
+    uint16_t data = 0;
+    int i;
+
+    // 1. PREAMBLE: 32 个 1
+    mdio_set_output();
+    for (i = 0; i < 32; i++) {
+        HAL_GPIO_WritePin(MDIO_PORT, MDIO_PIN, GPIO_PIN_SET);
+        mdc_toggle();
+    }
+
+    // 2. 构建读命令帧:
+    //    ST(2)=01, OP(2)=10(read), PHYAD(5), REGAD(5), TA(2)=Z0
+    //    高位在前发送
+    frame = (0x01UL << 28)                // ST = 01
+          | (0x02UL << 26)                // OP = 10 (读)
+          | ((phy_addr & 0x1F) << 21)     // PHY 地址
+          | ((reg_addr & 0x1F) << 16);    // 寄存器地址
+
+    // 3. 发送 16 位 (ST + OP + PHYAD + REGAD = 14 位, 实际 frame 只用了高 14 位)
+    //    实际发送: ST(2) + OP(2) + PHYAD(5) + REGAD(5) = 14 位
+    for (i = 15; i >= 0; i--) {
+        HAL_GPIO_WritePin(MDIO_PORT, MDIO_PIN,
+            (frame & (1UL << i)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        mdc_toggle();
+    }
+
+    // 4. Turnaround: 第 1 位高阻 (Z), 第 2 位 PHY 驱动为 0
+    mdio_set_input();               // 高阻
+    mdc_toggle();                    // Z
+    mdc_toggle();                    // PHY 驱动 0
+
+    // 5. 读取 16 位数据
+    for (i = 15; i >= 0; i--) {
+        HAL_GPIO_WritePin(MDC_PORT, MDC_PIN, GPIO_PIN_SET);
+        MDIO_DELAY();
+        if (HAL_GPIO_ReadPin(MDIO_PORT, MDIO_PIN) == GPIO_PIN_SET) {
+            data |= (1 << i);
+        }
+        HAL_GPIO_WritePin(MDC_PORT, MDC_PIN, GPIO_PIN_RESET);
+        MDIO_DELAY();
+    }
+
+    mdio_set_output();
+    return data;
+}
+
+// Clause 22 MDIO 写操作
+static void mdio_write(uint8_t phy_addr, uint8_t reg_addr, uint16_t data) {
+    uint32_t frame;
+    int i;
+
+    mdio_set_output();
+
+    // PREAMBLE: 32 个 1
+    for (i = 0; i < 32; i++) {
+        HAL_GPIO_WritePin(MDIO_PORT, MDIO_PIN, GPIO_PIN_SET);
+        mdc_toggle();
+    }
+
+    // ST=01, OP=01(write), PHYAD, REGAD, TA=10, DATA
+    frame = (0x01UL << 28)
+          | (0x01UL << 26)
+          | ((phy_addr & 0x1F) << 21)
+          | ((reg_addr & 0x1F) << 16)
+          | (0x02UL << 14)             // TA = 10
+          | (data & 0xFFFF);
+
+    // 发送 32 位 (14 位命令 + 2 位 TA + 16 位数据)
+    for (i = 31; i >= 0; i--) {
+        HAL_GPIO_WritePin(MDIO_PORT, MDIO_PIN,
+            (frame & (1UL << i)) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+        mdc_toggle();
+    }
+}
+
+// 第 1 天主函数: 读取 PHY ID
+int main(void) {
+    HAL_Init();
+    phy_gpio_init();
+
+    printf("\r\n==================================\r\n");
+    printf("   Day 1: Hello PHY\r\n");
+    printf("==================================\r\n");
+
+    uint8_t phy_addr = 0;  // LAN8720A 默认地址
+
+    // 尝试读取 PHY ID 寄存器
+    uint16_t id1 = mdio_read(phy_addr, 0x02);  // PHYIDR1
+    uint16_t id2 = mdio_read(phy_addr, 0x03);  // PHYIDR2
+
+    uint32_t phy_id = ((uint32_t)id1 << 16) | id2;
+
+    printf("PHY ID High (Reg 0x02): 0x%04X\r\n", id1);
+    printf("PHY ID Low  (Reg 0x03): 0x%04X\r\n", id2);
+    printf("Full PHY ID: 0x%08X\r\n", phy_id);
+
+    if (phy_id == 0x0007C0F1) {
+        printf("*** LAN8720A 检测成功! ***\r\n");
+    } else if (id1 == 0xFFFF && id2 == 0xFFFF) {
+        printf("*** 错误: 读到 0xFFFF, 检查硬件连接和上拉电阻! ***\r\n");
+    } else if (id1 == 0x0000 && id2 == 0x0000) {
+        printf("*** 错误: 读到 0x0000, 检查 MDIO 引脚配置! ***\r\n");
+    } else {
+        printf("*** 未知 PHY, 检查 PHY 地址是否正确 (尝试 0x01-0x1F) ***\r\n");
+    }
+
+    while (1);
+}
+```
+
+**预期输出**：
+```
+==================================
+   Day 1: Hello PHY
+==================================
+PHY ID High (Reg 0x02): 0x0007
+PHY ID Low  (Reg 0x03): 0xC0F1
+Full PHY ID: 0x0007C0F1
+*** LAN8720A 检测成功! ***
+```
+
+**故障排除 (如果输出不对)**：
+
+| 现象 | 原因 | 解决方法 |
+|------|------|----------|
+| 读到 `0xFFFF` | MDIO 线上拉不足或 PHY 没上电 | 检查 MDIO 的 1.5k-2.2k 上拉到 3.3V，测量 PHY 电源 |
+| 读到 `0x0000` | MDIO 引脚配置为推挽输出（不是开漏） | 修改 GPIO 模式为 `GPIO_MODE_OUTPUT_OD` |
+| 读到其他值但不是 0x0007C0F1 | PHY 地址不对 | 尝试地址 1-31 (LAN8720A 的 RXER/PHYAD0 引脚决定地址) |
+| 毫无输出 | 串口未初始化或 MCU 未运行 | 检查串口配置和时钟 |
+
+**学到的东西**：
+- MDIO 是类似 I2C 的同步串行总线，但更简单（单向时钟，主机控制全部时序）
+- PHY ID 是识别芯片的唯一标识
+- 读回 0xFFFF 通常表示总线通信失败（三态总线上的默认电平）
+
+---
+
+#### 第 2 天：PHY 复位序列
+
+**目标**：掌握硬件复位和软件复位的正确时序。
+
+**关键概念**：
+- **硬件复位**：拉低 RST_N 引脚至少 10ms，释放后等待 50ms 让 PHY 内部初始化
+- **软件复位**：写 BMCR(0x00) 的 bit15=1，然后轮询等待该位自清除
+
+**完整代码**：
+
+```c
+// 第 2 天: PHY 复位
+// 在前一天代码基础上添加以下函数
+
+#define BMCR_REG        0x00
+#define BMCR_RESET      (1 << 15)
+
+// 硬件复位 (假设 PHY_RST 接 PC0)
+#define RST_PORT    GPIOC
+#define RST_PIN     GPIO_PIN_0
+
+static void phy_hardware_reset(void) {
+    GPIO_InitTypeDef gpio = {0};
+
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    gpio.Pin = RST_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(RST_PORT, &gpio);
+
+    // 拉低复位引脚
+    HAL_GPIO_WritePin(RST_PORT, RST_PIN, GPIO_PIN_RESET);
+    delay_ms(50);   // 保持复位至少 10ms，给 50ms 留足余量
+    printf("硬件复位: RST 拉低 50ms...\r\n");
+
+    // 释放复位
+    HAL_GPIO_WritePin(RST_PORT, RST_PIN, GPIO_PIN_SET);
+    delay_ms(100);  // 等待 PHY 内部初始化完成
+    printf("硬件复位释放，等待 100ms 初始化...\r\n");
+}
+
+// 软件复位
+static int phy_soft_reset(uint8_t phy_addr) {
+    uint16_t val;
+    uint32_t timeout;
+
+    printf("软件复位开始...\r\n");
+
+    // 读 BMCR
+    val = mdio_read(phy_addr, BMCR_REG);
+    printf("  当前 BMCR = 0x%04X\r\n", val);
+
+    // 设置 bit15 = 1 (触发复位)
+    val |= BMCR_RESET;
+    mdio_write(phy_addr, BMCR_REG, val);
+
+    // 等待复位完成 (bit15 自清除)
+    timeout = 500;  // 最多等 500ms
+    while (timeout--) {
+        delay_ms(1);
+        val = mdio_read(phy_addr, BMCR_REG);
+        if ((val & BMCR_RESET) == 0) {
+            printf("  软件复位完成 (耗时 %lu ms)\r\n", 500 - timeout);
+            return 0;  // 成功
+        }
+    }
+
+    printf("  错误: 软件复位超时!\r\n");
+    return -1;  // 失败
+}
+
+// 测试主函数
+int main(void) {
+    HAL_Init();
+    phy_gpio_init();
+    SystemClock_Config();  // 配置系统时钟
+
+    printf("\r\n==================================\r\n");
+    printf("   Day 2: PHY Reset Sequence\r\n");
+    printf("==================================\r\n");
+
+    uint8_t addr = 0;
+
+    // 1. 硬件复位
+    phy_hardware_reset();
+    delay_ms(50);
+
+    // 2. 确认 PHY 存在
+    uint16_t id1 = mdio_read(addr, 0x02);
+    uint16_t id2 = mdio_read(addr, 0x03);
+    printf("复位后 PHY ID: 0x%04X%04X\r\n", id1, id2);
+
+    // 3. 软件复位
+    if (phy_soft_reset(addr) == 0) {
+        printf("PHY 软复位成功!\r\n");
+    } else {
+        printf("PHY 软复位失败!\r\n");
+    }
+
+    // 4. 复位后验证 BMCR 应为默认值
+    uint16_t bmcr = mdio_read(addr, BMCR_REG);
+    printf("复位后 BMCR = 0x%04X (期望 0x1000 左右)\r\n", bmcr);
+
+    while (1);
+}
+```
+
+**预期输出**：
+```
+==================================
+   Day 2: PHY Reset Sequence
+==================================
+硬件复位: RST 拉低 50ms...
+硬件复位释放，等待 100ms 初始化...
+复位后 PHY ID: 0x0007C0F1
+软件复位开始...
+  当前 BMCR = 0x1000
+  软件复位完成 (耗时 2 ms)
+PHY 软复位成功!
+复位后 BMCR = 0x1000 (期望 0x1000 左右)
+```
+
+**调试技巧**：
+- 如果软件复位后 BMCR 仍然是 0x8000（复位位没清除），说明要么 MDIO 写入没生效，要么 PHY 处于异常状态
+- 如果在读 BMCR 时有时稳定有时读到 0xFFFF，检查 MDIO 线上拉和 MDC 频率（不要超过 2.5MHz）
+- 不同 PHY 的复位时间不同：LAN8720A 最快（几 ms），KSZ9031 可能需 100ms
+
+**学到的东西**：
+- 硬件复位和软件复位是两种不同的复位方式
+- BMCR 的 bit15 是"自清除"位（写 1 触发，复位完成后自动变回 0）
+- 复位后 PHY 寄存器回到默认值
+
+---
+
+#### 第 3 天：链路状态检测
+
+**目标**：实时监测网线插拔状态，理解 BMSR Latching 行为。
+
+**关键知识点 -- Latching Low 机制**：
+BMSR 寄存器的 bit2 (Link Status) 是一个"锁存低"位：
+- 当链路正常时，bit2 = 1
+- 当链路断开时，bit2 变 0 并**保持**，直到 CPU 读取该寄存器后才更新为当前值
+- **必须连续读两次**：第一次清除 latch，第二次得到真实状态
+
+```c
+// 第 3 天: 链路状态检测
+
+#define BMSR_REG        0x01
+#define BMSR_LINK_STATUS  (1 << 2)
+#define BMSR_AUTONEG_DONE (1 << 5)
+
+// 读取链路状态 (正确做法: 读两次!)
+static int phy_read_link(uint8_t phy_addr) {
+    uint16_t val;
+
+    // 第一次读取: 清除 latching
+    mdio_read(phy_addr, BMSR_REG);
+
+    // 第二次读取: 真实值
+    val = mdio_read(phy_addr, BMSR_REG);
+
+    return (val & BMSR_LINK_STATUS) ? 1 : 0;
+}
+
+// 读取协商完成状态
+static int phy_is_autoneg_done(uint8_t phy_addr) {
+    uint16_t val;
+
+    mdio_read(phy_addr, BMSR_REG);  // 清 latch
+    val = mdio_read(phy_addr, BMSR_REG);
+
+    return (val & BMSR_AUTONEG_DONE) ? 1 : 0;
+}
+
+// 演示 Latching 现象
+static void demo_latching(uint8_t phy_addr) {
+    printf("\r\n--- Latching 行为演示 ---\r\n");
+
+    uint16_t read1 = mdio_read(phy_addr, BMSR_REG);
+    uint16_t read2 = mdio_read(phy_addr, BMSR_REG);
+
+    printf("第一次读 BMSR = 0x%04X\r\n", read1);
+    printf("第二次读 BMSR = 0x%04X\r\n", read2);
+    printf("第一次 Link bit = %d\r\n", (read1 >> 2) & 1);
+    printf("第二次 Link bit = %d (真实值)\r\n", (read2 >> 2) & 1);
+
+    if (((read1 >> 2) & 1) == 0 && ((read2 >> 2) & 1) == 1) {
+        printf("--> 看到 Latching 效果: 第一次读了 latch 的旧值 (0),\r\n");
+        printf("    第二次才读到真实值 (1)。\r\n");
+    }
+}
+
+// 链路监视器
+static void link_monitor(uint8_t phy_addr) {
+    int last_link = -1;  // 上次状态 (初始化为未定义)
+    int link;
+    uint32_t tick = HAL_GetTick();
+
+    printf("\r\n链路监视器启动 (每 200ms 轮询)\r\n");
+    printf("请插拔网线观察...\r\n");
+
+    while (1) {
+        link = phy_read_link(phy_addr);
+
+        if (link != last_link) {
+            uint32_t now = HAL_GetTick();
+            printf("[%lu ms] 链路状态变化: %s -> %s\r\n",
+                   now - tick,
+                   last_link == -1 ? "?" : (last_link ? "UP" : "DOWN"),
+                   link ? "UP" : "DOWN");
+
+            if (link) {
+                // 链路建立，看看协商完成了没有
+                delay_ms(500);  // 等一会让协商完成
+                if (phy_is_autoneg_done(phy_addr)) {
+                    printf("  自动协商完成!\r\n");
+                } else {
+                    printf("  链路已建但协商未完成 (可能并行检测)\r\n");
+                }
+            }
+            last_link = link;
+        }
+
+        delay_ms(200);
+    }
+}
+
+int main(void) {
+    HAL_Init();
+    phy_gpio_init();
+    SystemClock_Config();
+
+    printf("\r\n==================================\r\n");
+    printf("   Day 3: Link Status Detection\r\n");
+    printf("==================================\r\n");
+
+    uint8_t addr = 0;
+
+    printf("PHY 地址: 0x%02X\r\n", addr);
+
+    // 先做一次复位
+    phy_soft_reset(addr);
+
+    // 演示 Latching 行为
+    demo_latching(addr);
+
+    // 启动链路监视 (在这之前先把网线拔插几次)
+    printf("\r\n按复位键重新开始链路监视...\r\n");
+    delay_ms(3000);
+
+    link_monitor(addr);
+
+    return 0;
+}
+```
+
+**预期输出**（当插拔网线时）：
+```
+==================================
+   Day 3: Link Status Detection
+==================================
+PHY 地址: 0x00
+
+--- Latching 行为演示 ---
+第一次读 BMSR = 0x7824
+第二次读 BMSR = 0x782D
+第一次 Link bit = 1
+第二次 Link bit = 1 (真实值)
+--> 如果拔掉网线再读:
+第一次读 BMSR = 0x7828 (Link bit = 0, 但其他位可能没变!)
+第二次读 BMSR = 0x7820 (Link bit = 0)
+
+链路监视器启动 (每 200ms 轮询)
+请插拔网线观察...
+[1234 ms] 链路状态变化: ? -> UP
+  自动协商完成!
+[5678 ms] 链路状态变化: UP -> DOWN
+[7890 ms] 链路状态变化: DOWN -> UP
+  自动协商完成!
+```
+
+**深入理解 Latching**：
+Latching 机制是为"边沿检测"而设计的——硬件在 Link 从 Up 变 Down 时锁存 0，这样即使 Link 瞬间恢复，CPU 也能知道曾经断开过。代价是：必须读两次才能获得当前值。
+
+**学到的东西**：
+- BMSR Latching 行为是新手最常见的坑
+- 链路检测是 PHY 驱动的核心功能
+- 轮询间隔影响响应速度和 CPU 占用
+
+---
+
+#### 第 4 天：自动协商 (Auto-Negotiation)
+
+**目标**：配置 ANAR 发布能力，启动协商，等待完成，读取协商结果。
+
+```c
+// 第 4 天: 自动协商
+
+#define BMCR_REG            0x00
+#define BMCR_AUTONEG_EN     (1 << 12)
+#define BMCR_RESTART_ANEG   (1 << 9)
+
+#define BMSR_REG            0x01
+#define BMSR_AUTONEG_DONE   (1 << 5)
+
+#define ANAR_REG            0x04
+#define ANAR_100TX_FD       (1 << 8)
+#define ANAR_100TX_HD       (1 << 7)
+#define ANAR_10T_FD         (1 << 6)
+#define ANAR_10T_HD         (1 << 5)
+#define ANAR_SELECTOR       (1 << 0)  // IEEE 802.3
+
+#define ANLPAR_REG          0x05
+
+// 配置并启动自动协商
+static int phy_start_autoneg(uint8_t phy_addr) {
+    uint16_t anar, bmcr;
+
+    // 1. 配置 ANAR: 发布本端能力
+    anar = ANAR_SELECTOR       // IEEE 802.3 协议选择器
+         | ANAR_100TX_FD       // 100M 全双工
+         | ANAR_100TX_HD       // 100M 半双工
+         | ANAR_10T_FD         // 10M 全双工
+         | ANAR_10T_HD;        // 10M 半双工
+
+    mdio_write(phy_addr, ANAR_REG, anar);
+    printf("ANAR 配置: 0x%04X (已发布 10/100M FD/HD)\r\n", anar);
+
+    // 2. 写 BMCR: 使能 Auto-Neg 并重启
+    bmcr = mdio_read(phy_addr, BMCR_REG);
+    bmcr |= BMCR_AUTONEG_EN | BMCR_RESTART_ANEG;
+    mdio_write(phy_addr, BMCR_REG, bmcr);
+    printf("BMCR 写入: 0x%04X (使能 ANEG + 重启)\r\n", bmcr);
+
+    return 0;
+}
+
+// 等待自动协商完成 (带超时)
+static int phy_wait_autoneg_done(uint8_t phy_addr, uint32_t timeout_ms) {
+    uint32_t start = HAL_GetTick();
+
+    printf("等待协商完成...\r\n");
+
+    while ((HAL_GetTick() - start) < timeout_ms) {
+        mdio_read(phy_addr, BMSR_REG);  // 清 latch
+        uint16_t bmsr = mdio_read(phy_addr, BMSR_REG);
+
+        if (bmsr & BMSR_AUTONEG_DONE) {
+            printf("  协商完成! (耗时 %lu ms)\r\n", HAL_GetTick() - start);
+            return 0;  // 成功
+        }
+
+        // 如果链路还没建，等一下
+        if (bmsr & (1 << 2)) {  // Link up
+            // 继续等协商完成
+        } else {
+            // 没链路的等待
+        }
+
+        delay_ms(50);
+    }
+
+    printf("  错误: 协商超时 (%lu ms)!\r\n", timeout_ms);
+    return -1;
+}
+
+// 读取协商结果
+static void phy_print_negotiation_result(uint8_t phy_addr) {
+    uint16_t anar, anlpar;
+    uint16_t common;
+
+    // 读取本端发布的能力
+    anar = mdio_read(phy_addr, ANAR_REG);
+
+    // 读取对端能力 (Link Partner)
+    mdio_read(phy_addr, BMSR_REG);  // 先清 latch
+    anlpar = mdio_read(phy_addr, ANLPAR_REG);
+
+    // 共同能力 (取交集)
+    common = anar & anlpar;
+
+    printf("\r\n--- 协商结果 ---\r\n");
+    printf("本端 ANAR:  0x%04X\r\n", anar);
+    printf("对端 ANLPAR: 0x%04X\r\n", anlpar);
+    printf("共同能力:    0x%04X\r\n", common);
+
+    printf("\r\n协商速度/双工:\r\n");
+    if (common & ANAR_100TX_FD) printf("  [V] 100M 全双工 (首选)\r\n");
+    if (common & ANAR_100TX_HD) printf("  [V] 100M 半双工\r\n");
+    if (common & ANAR_10T_FD)   printf("  [V] 10M 全双工\r\n");
+    if (common & ANAR_10T_HD)   printf("  [V] 10M 半双工\r\n");
+
+    // 判断实际协商结果 (HCD 算法)
+    if (common & ANAR_100TX_FD) {
+        printf("\r\n实际协商: 100M 全双工\r\n");
+    } else if (common & ANAR_100TX_HD) {
+        printf("\r\n实际协商: 100M 半双工\r\n");
+    } else if (common & ANAR_10T_FD) {
+        printf("\r\n实际协商: 10M 全双工\r\n");
+    } else if (common & ANAR_10T_HD) {
+        printf("\r\n实际协商: 10M 半双工\r\n");
+    } else {
+        printf("\r\n协商失败 (无共同能力)\r\n");
+    }
+}
+
+int main(void) {
+    HAL_Init();
+    phy_gpio_init();
+    SystemClock_Config();
+
+    printf("\r\n==================================\r\n");
+    printf("   Day 4: Auto-Negotiation\r\n");
+    printf("==================================\r\n");
+
+    uint8_t addr = 0;
+
+    // 1. 复位
+    phy_soft_reset(addr);
+
+    // 2. 启动协商
+    phy_start_autoneg(addr);
+
+    // 3. 等待完成 (最多等 5 秒)
+    if (phy_wait_autoneg_done(addr, 5000) == 0) {
+        // 4. 打印结果
+        phy_print_negotiation_result(addr);
+    } else {
+        printf("协商未完成，请检查网线连接。\r\n");
+    }
+
+    while (1);
+}
+```
+
+**预期输出**：
+```
+==================================
+   Day 4: Auto-Negotiation
+==================================
+ANAR 配置: 0x01E1 (已发布 10/100M FD/HD)
+BMCR 写入: 0x1200 (使能 ANEG + 重启)
+等待协商完成...
+  协商完成! (耗时 1523 ms)
+
+--- 协商结果 ---
+本端 ANAR:  0x01E1
+对端 ANLPAR: 0x01E1
+共同能力:    0x01E1
+
+  [V] 100M 全双工 (首选)
+  [V] 100M 半双工
+  [V] 10M 全双工
+  [V] 10M 半双工
+
+实际协商: 100M 全双工
+```
+
+**故障排除**：
+
+| 现象 | 原因 | 解决方法 |
+|------|------|----------|
+| 协商永远不完成 | 网线没插或对端没上电 | 插网线，确认对端设备亮了 |
+| ANLPAR 全 0 | 对端不支持 Auto-Neg (老设备) | PHY 会自动回退到并行检测 |
+| 协商结果总是 10M HD | 网线质量差或距离太长 | 换一根短网线试试 |
+| 协商超时但 Link 是 up | 对端强制设置速度 | 读取 ANER 检查并行检测状态 |
+
+**学到的东西**：
+- ANAR 是"我说我能跑多快"，ANLPAR 是"对方说它能跑多快"
+- HCD 算法取双方都支持的最高速度
+- 协商需要 1-3 秒（FLP 脉冲交换需要时间）
+
+---
+
+#### 第 5 天：读取对端设备信息
+
+**目标**：通过 ANLPAR 了解另一端网络设备的能力，连接到不同设备观察不同结果。
+
+```c
+// 第 5 天: 读取对端能力
+
+// 解析 ANLPAR 并显示人类可读的信息
+static void phy_print_partner_capabilities(uint8_t phy_addr) {
+    uint16_t anlpar;
+    int is_1000m = 0;
+    uint16_t estatus;
+
+    // 读取 ANLPAR
+    mdio_read(phy_addr, BMSR_REG);  // 清 latch
+    anlpar = mdio_read(phy_addr, ANLPAR_REG);
+
+    printf("\r\n========== 对端设备能力 ==========\r\n");
+    printf("ANLPAR 值: 0x%04X\r\n", anlpar);
+    printf("二进制:    ");
+    for (int i = 15; i >= 0; i--) {
+        printf("%c", (anlpar >> i) & 1 ? '1' : '0');
+        if (i == 8 || i == 4) printf(" ");
+    }
+    printf("\r\n\r\n");
+
+    // 解析能力
+    printf("支持的速率和双工:\r\n");
+
+    if (anlpar & (1 << 9)) printf("  [ ] 100Base-T4 (已过时)\r\n");
+    if (anlpar & (1 << 8)) printf("  [V] 100Base-TX 全双工\r\n");
+    if (anlpar & (1 << 7)) printf("  [V] 100Base-TX 半双工\r\n");
+    if (anlpar & (1 << 6)) printf("  [V] 10Base-T 全双工\r\n");
+    if (anlpar & (1 << 5)) printf("  [V] 10Base-T 半双工\r\n");
+
+    printf("\r\n流控能力:\r\n");
+    if (anlpar & (1 << 10)) printf("  [V] PAUSE (对称流控)\r\n");
+    if (anlpar & (1 << 11)) printf("  [V] ASM_DIR (不对称流控)\r\n");
+
+    // 检查对端是否支持 Next Page
+    if (anlpar & (1 << 15)) {
+        printf("\r\n  [V] 支持 Next Page\r\n");
+
+        // 检查是否有千兆能力
+        estatus = mdio_read(phy_addr, 0x0F);
+        if (estatus & (1 << 15)) {
+            is_1000m = 1;
+            printf("  [V] 1000Base-T 全双工 (千兆)\r\n");
+        }
+        if (estatus & (1 << 14)) {
+            printf("  [V] 1000Base-T 半双工\r\n");
+        }
+    }
+
+    printf("\r\n选择器字段: 0x%X (00001=IEEE 802.3)\r\n", anlpar & 0x1F);
+
+    printf("\r\n设备类型推测:\r\n");
+    if (anlpar & (1 << 10)) {
+        printf("  -> 可能是交换机或路由器 (支持流控)\r\n");
+    } else {
+        printf("  -> 可能是 PC 或简单设备 (不支持流控)\r\n");
+    }
+    if (is_1000m) {
+        printf("  -> 千兆设备\r\n");
+    } else if (anlpar & (1 << 8)) {
+        printf("  -> 百兆设备\r\n");
+    } else {
+        printf("  -> 十兆设备\r\n");
+    }
+    printf("==================================\r\n");
+}
+
+// 扫描所有 PHY 地址 (看总线上有哪些设备)
+static void phy_scan_bus(void) {
+    printf("\r\n--- 扫描 MDIO 总线 ---\r\n");
+
+    for (uint8_t addr = 0; addr < 32; addr++) {
+        uint16_t id1 = mdio_read(addr, 0x02);
+        if (id1 == 0x0000 || id1 == 0xFFFF) {
+            continue;  // 这个地址没有 PHY
+        }
+        uint16_t id2 = mdio_read(addr, 0x03);
+        printf("地址 0x%02X: PHY ID = 0x%04X%04X\r\n", addr, id1, id2);
+    }
+
+    printf("--- 扫描结束 ---\r\n");
+}
+
+int main(void) {
+    HAL_Init();
+    phy_gpio_init();
+    SystemClock_Config();
+
+    printf("\r\n==================================\r\n");
+    printf("   Day 5: Link Partner Info\r\n");
+    printf("==================================\r\n");
+
+    uint8_t addr = 0;
+
+    // 先扫描总线看看有哪些 PHY
+    phy_scan_bus();
+
+    // 复位并等待链路
+    phy_soft_reset(addr);
+
+    printf("\r\n请将网线连接到不同设备观察:\r\n");
+    printf("  - 交换机 (Switch)\r\n");
+    printf("  - 路由器 (Router)\r\n");
+    printf("  - 电脑 (PC)\r\n");
+    printf("  - 另一块开发板\r\n");
+    printf("每次连接后按复位键查看结果\r\n");
+
+    delay_ms(3000);
+
+    // 如果没连网线，等一会
+    printf("\r\n等待链路建立...\r\n");
+    for (int i = 0; i < 30; i++) {
+        mdio_read(addr, BMSR_REG);
+        uint16_t bmsr = mdio_read(addr, BMSR_REG);
+        if (bmsr & (1 << 2)) {
+            printf("链路已建立!\r\n");
+            break;
+        }
+        printf(".");
+        delay_ms(200);
+    }
+    printf("\r\n");
+
+    // 显示对端能力
+    phy_print_partner_capabilities(addr);
+
+    while (1);
+}
+```
+
+**实验建议**：
+分别连接以下设备并观察 ANLPAR 的差异：
+
+| 对端设备 | 预期 ANLPAR | 特点 |
+|----------|-------------|------|
+| 百兆交换机 | 0x01E1 | 支持 10/100 FD/HD |
+| 千兆交换机 | 0x01E1 + ESTATUS 位 | 会额外有千兆能力位 |
+| 电脑网卡 (1G) | 0x01E1 | 通常带流控标志 |
+| 另一块开发板 (强制 100M FD) | 无 ANLPAR | 并行检测模式 |
+
+**学到的东西**：
+- ANLPAR 是了解对端设备最直接的窗口
+- 不同设备类型有不同能力组合
+- 千兆通过 Next Page 交换额外信息
+
+---
+
+#### 第 6 天：PHY 中断
+
+**目标**：配置 PHY 中断，写中断服务函数，实现链路变化的事件驱动检测。
+
+```c
+// 第 6 天: PHY 中断
+
+// LAN8720A 中断寄存器
+#define LAN8720A_REG_ISR    0x1D  // 中断状态 (读即清除)
+#define LAN8720A_REG_IMR    0x1E  // 中断掩码 (1=使能)
+
+#define LAN8720A_ISR_ANEG_DONE   (1 << 12)
+#define LAN8720A_ISR_LINK_DOWN   (1 << 11)
+#define LAN8720A_ISR_REMOTE_FLT  (1 << 10)
+#define LAN8720A_ISR_LINK_UP     (1 << 9)
+#define LAN8720A_ISR_WOL         (1 << 8)
+
+// 全局变量
+static volatile int g_link_up = 0;
+static volatile int g_int_occurred = 0;
+
+// 配置 PHY 中断
+static void phy_enable_interrupt(uint8_t phy_addr) {
+    uint16_t mask;
+
+    // 启用 Link Up + Link Down 中断
+    mask = LAN8720A_ISR_LINK_UP | LAN8720A_ISR_LINK_DOWN;
+    mdio_write(phy_addr, LAN8720A_REG_IMR, mask);
+
+    // 读取一次 ISR 以清除任何挂起的中断
+    mdio_read(phy_addr, LAN8720A_REG_ISR);
+
+    printf("PHY 中断已使能 (监测 Link Up/Down)\r\n");
+}
+
+// 清除中断配置
+static void phy_disable_interrupt(uint8_t phy_addr) {
+    mdio_write(phy_addr, LAN8720A_REG_IMR, 0);
+    printf("PHY 中断已禁用\r\n");
+}
+
+// PHY 中断服务函数 (在 GPIO 中断中调用)
+void phy_irq_handler(uint8_t phy_addr) {
+    uint16_t isr;
+
+    // 读取中断状态 (读即清除)
+    isr = mdio_read(phy_addr, LAN8720A_REG_ISR);
+
+    g_int_occurred = 1;
+
+    printf("\r\n[IRQ] PHY 中断触发! ISR = 0x%04X\r\n", isr);
+
+    if (isr & LAN8720A_ISR_LINK_UP) {
+        printf("[IRQ] Link UP!\r\n");
+
+        // 等一会让协商稳定
+        delay_ms(100);
+
+        // 读取链接状态
+        mdio_read(phy_addr, BMSR_REG);
+        uint16_t bmsr = mdio_read(phy_addr, BMSR_REG);
+        if (bmsr & (1 << 5)) {
+            printf("[IRQ] 自动协商完成\r\n");
+        }
+
+        // 读取速度 (通过 LAN8720A 特殊寄存器 0x1F)
+        uint16_t scsr = mdio_read(phy_addr, 0x1F);
+        int speed_100 = (scsr >> 14) & 1;
+        int full_duplex = (scsr >> 13) & 1;
+
+        printf("[IRQ] 速度: %s, 双工: %s\r\n",
+               speed_100 ? "100M" : "10M",
+               full_duplex ? "Full" : "Half");
+
+        g_link_up = 1;
+    }
+
+    if (isr & LAN8720A_ISR_LINK_DOWN) {
+        printf("[IRQ] Link DOWN!\r\n");
+        g_link_up = 0;
+    }
+
+    if (isr & LAN8720A_ISR_ANEG_DONE) {
+        printf("[IRQ] 自动协商完成 (单独通知)\r\n");
+    }
+
+    if (isr & LAN8720A_ISR_REMOTE_FLT) {
+        printf("[IRQ] 远端故障!\r\n");
+    }
+}
+
+int main(void) {
+    HAL_Init();
+    phy_gpio_init();
+    SystemClock_Config();
+
+    printf("\r\n==================================\r\n");
+    printf("   Day 6: PHY Interrupts\r\n");
+    printf("==================================\r\n");
+
+    uint8_t addr = 0;
+
+    // 1. 复位并初始化
+    phy_soft_reset(addr);
+
+    // 2. 配置中断
+    phy_enable_interrupt(addr);
+
+    printf("\r\n现在插拔网线测试中断:\r\n");
+    printf("(假设 PHY 的 nINT 引脚已连接到 MCU 的外部中断引脚)\r\n");
+    printf("本示例中每 500ms 轮询模拟中断处理\r\n");
+
+    // 由于本教程使用轮询方式访问 MDIO，
+    // 我们模拟中断处理: 定期检查 ISR
+    int last_link = -1;
+
+    while (1) {
+        // 模拟中断: 检查 ISR 是否有事件
+        uint16_t isr = mdio_read(addr, LAN8720A_REG_ISR);
+
+        if (isr != 0) {
+            // 有中断事件
+            printf("\r\n[轮询检测] ISR = 0x%04X\r\n", isr);
+
+            if (isr & LAN8720A_ISR_LINK_UP) {
+                printf("  -> Link UP\r\n");
+                g_link_up = 1;
+            }
+            if (isr & LAN8720A_ISR_LINK_DOWN) {
+                printf("  -> Link DOWN\r\n");
+                g_link_up = 0;
+            }
+            if (isr & LAN8720A_ISR_ANEG_DONE) {
+                printf("  -> Auto-Neg Done\r\n");
+            }
+        }
+
+        // 打印状态变化
+        int current_link = 0;
+        mdio_read(addr, BMSR_REG);
+        uint16_t bmsr = mdio_read(addr, BMSR_REG);
+        current_link = (bmsr >> 2) & 1;
+
+        if (current_link != last_link) {
+            printf("链路状态: %s -> %s\r\n",
+                   last_link == -1 ? "?" : (last_link ? "UP" : "DOWN"),
+                   current_link ? "UP" : "DOWN");
+            last_link = current_link;
+        }
+
+        delay_ms(500);
+    }
+}
+```
+
+**MCU 外部中断配置** (如果使用硬件中断引脚)：
+
+```c
+// 在 CubeMX 或代码中配置:
+// nINT 引脚 (假设接 PB0):
+//   GPIO mode: External Interrupt with Rising/Falling edge trigger
+//   因为 LAN8720A nINT 是开漏输出, 低电平有效
+
+void EXTI0_IRQHandler(void) {
+    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_0) != RESET) {
+        phy_irq_handler(0);  // 调用 PHY 中断处理
+        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_0);
+    }
+}
+```
+
+**学到的东西**：
+- 中断比轮询更高效，但代码更复杂
+- 不同 PHY 的中断寄存器布局不同
+- LAN8720A 的 ISR 是"读即清除"
+
+---
+
+#### 第 7 天：完整 PHY 监视器
+
+**目标**：综合前 6 天所学，做一个终端监视器，定期显示链路状态、速度、双工和对端能力。
+
+```c
+// 第 7 天: 完整 PHY 监视器
+
+// BMSR 解析
+static void parse_bmsr(uint16_t bmsr) {
+    printf("  BMSR = 0x%04X\r\n", bmsr);
+    printf("  Capabilities:");
+    if (bmsr & (1 << 14)) printf(" 100FD");
+    if (bmsr & (1 << 13)) printf(" 100HD");
+    if (bmsr & (1 << 12)) printf(" 10FD");
+    if (bmsr & (1 << 11)) printf(" 10HD");
+    printf("\r\n");
+
+    printf("  Link: %s  ", (bmsr >> 2) & 1 ? "UP  " : "DOWN");
+    printf("ANEG: %s  ", (bmsr >> 5) & 1 ? "DONE" : "....");
+    printf("Remote Fault: %s\r\n",
+           (bmsr >> 4) & 1 ? "YES" : "no");
+}
+
+// 通过 LAN8720A 特殊寄存器读取速度和双工
+static void read_speed_duplex(uint8_t phy_addr) {
+    uint16_t scsr = mdio_read(phy_addr, 0x1F);
+    int speed_100 = (scsr >> 14) & 1;
+    int full_duplex = (scsr >> 13) & 1;
+    int aneg_done = (scsr >> 12) & 1;
+
+    printf("  Speed:   %s\r\n", speed_100 ? "100 Mbps" : "10 Mbps");
+    printf("  Duplex:  %s\r\n", full_duplex ? "Full" : "Half");
+    printf("  ANEG:    %s\r\n", aneg_done ? "Completed" : "In Progress");
+
+    if (aneg_done) {
+        uint16_t anar = mdio_read(phy_addr, ANAR_REG);
+        uint16_t anlpar = mdio_read(phy_addr, ANLPAR_REG);
+        printf("  ANAR:    0x%04X\r\n", anar);
+        printf("  ANLPAR:  0x%04X\r\n", anlpar);
+    }
+}
+
+// 清屏函数 (通过发送转义序列)
+static void clear_screen(void) {
+    printf("\033[2J\033[H");  // ANSI 清屏
+}
+
+// 打印标题栏
+static void print_header(void) {
+    printf("========================================\r\n");
+    printf("   Ethernet PHY 监视器 v1.0\r\n");
+    printf("   PHY: LAN8720A @ 0x%02X\r\n", 0);
+    printf("   " __DATE__ " " __TIME__ "\r\n");
+    printf("========================================\r\n");
+}
+
+int main(void) {
+    HAL_Init();
+    phy_gpio_init();
+    SystemClock_Config();
+
+    uint8_t addr = 0;
+    uint32_t tick = 0;
+    int prev_link = -1;
+    uint32_t uptime = 0;
+
+    // 初始化: 软复位 + 启动协商
+    phy_soft_reset(addr);
+    phy_start_autoneg(addr);
+
+    printf("\r\nPHY 初始化完成，启动监视器...\r\n");
+    delay_ms(1000);
+
+    while (1) {
+        uptime = HAL_GetTick() / 1000;
+
+        // 每 1 秒刷新一次
+        if (HAL_GetTick() - tick >= 1000) {
+            clear_screen();
+            print_header();
+
+            printf("\r\n运行时间: %lu 秒\r\n", uptime);
+
+            // 读两次 BMSR
+            mdio_read(addr, BMSR_REG);
+            uint16_t bmsr = mdio_read(addr, BMSR_REG);
+
+            int link = (bmsr >> 2) & 1;
+            parse_bmsr(bmsr);
+
+            if (link) {
+                read_speed_duplex(addr);
+
+                // 每 10 秒打印一次对端能力
+                if ((uptime % 10) == 0 && uptime > 0) {
+                    printf("\r\n--- 对端能力 (每 10 秒刷新) ---\r\n");
+                    uint16_t anlpar = mdio_read(addr, ANLPAR_REG);
+                    printf("  100TX-FD: %s  100TX-HD: %s\r\n",
+                           (anlpar >> 8) & 1 ? "Y" : "N",
+                           (anlpar >> 7) & 1 ? "Y" : "N");
+                    printf("  10T-FD:   %s  10T-HD:   %s\r\n",
+                           (anlpar >> 6) & 1 ? "Y" : "N",
+                           (anlpar >> 5) & 1 ? "Y" : "N");
+                    printf("  PAUSE: %s  ASM_DIR: %s\r\n",
+                           (anlpar >> 10) & 1 ? "Y" : "N",
+                           (anlpar >> 11) & 1 ? "Y" : "N");
+                }
+            } else {
+                printf("\r\n  请插入网线...\r\n");
+            }
+
+            // 链路变化时报警
+            if (link != prev_link) {
+                printf("\r\n  *** 链路状态变化! ***\r\n");
+                prev_link = link;
+            }
+
+            printf("\r\n--- 按复位键重启 ---\r\n");
+
+            tick = HAL_GetTick();
+        }
+
+        // 其他任务 (网络协议栈等) 可以放在这里
+        // ...
+    }
+}
+```
+
+**预期输出**（终端监视器）：
+```
+========================================
+   Ethernet PHY 监视器 v1.0
+   PHY: LAN8720A @ 0x00
+   Jun 18 2026 12:00:00
+========================================
+
+运行时间: 42 秒
+
+  BMSR = 0x782D
+  Capabilities: 100FD 100HD 10FD 10HD
+  Link: UP    ANEG: DONE  Remote Fault: no
+  Speed:   100 Mbps
+  Duplex:  Full
+  ANEG:    Completed
+  ANAR:    0x01E1
+  ANLPAR:  0x01E1
+
+--- 对端能力 (每 10 秒刷新) ---
+  100TX-FD: Y  100TX-HD: Y
+  10T-FD:   Y  10T-HD:   Y
+  PAUSE: N  ASM_DIR: N
+
+--- 按复位键重启 ---
+```
+
+**扩展建议**：
+- 增加链路抖动检测和去抖逻辑 (参考主线文档第 5.4 节)
+- 保存历史状态用于诊断
+- 通过串口命令交互 (参考附录 B)
+
+---
+
+### C.3 初学者常见错误 (Common Beginner Mistakes)
+
+以下是从数十个 PHY 驱动开发实战中总结的高频问题：
+
+#### 1. MDIO 缺少上拉电阻
+- **错误现象**：所有 PHY 寄存器都读到 0xFFFF
+- **根本原因**：MDIO 是开漏总线，必须外部上拉
+- **正确做法**：在 MDIO 线上接 1.5k-2.2k 电阻到 3.3V
+- **验证方法**：不接 PHY 时量 MDIO 电压，应为 3.3V
+
+#### 2. PHY 地址搞错
+- **错误现象**：读 ID 返回 0xFFFF 或 0x0000，但确认电路连接正确
+- **根本原因**：PHY 地址由 strapping 引脚决定，不同模块可能不同
+- **正确做法**：LAN8720A 默认地址是 **0**（RXER/PHYAD0 引脚拉低），但有些模块拉高到 **1**
+- **扫描技巧**：写个循环扫 0-31 地址看哪个能返回有效 ID
+
+#### 3. 没等 PLL 锁定就开始读
+- **错误现象**：复位后立刻读寄存器，有时读到正确值，有时读 0xFFFF
+- **根本原因**：PHY 内部的 PLL (锁相环) 上电后需要时间稳定
+- **正确做法**：硬件复位释放后至少等 **100ms** 再开始 MDIO 通信
+
+#### 4. BMSR Latching 导致误判
+- **错误现象**：链路明明是通的，但软件判断为断开
+- **根本原因**：只读了一次 BMSR，读到了 latch 的 0
+- **正确做法**：BMSR 必须**连续读两次**，第二次才是当前状态
+
+#### 5. ANLPAR 读取时机不对
+- **错误现象**：ANLPAR 为 0 或不全
+- **根本原因**：在协商完成前读取 ANLPAR
+- **正确做法**：先确认 BMSR.bit5 (ANEG Complete) = 1，**再**读 ANLPAR
+
+#### 6. ETH 时钟没使能
+- **错误现象**：PHY 正常工作（Link 灯亮），但 MCU 的 MAC 收不到数据
+- **根本原因**：RMII 模式下，REF_CLK (50MHz) 未正确配置
+- **正确做法**：
+  - LAN8720A：由外部 50MHz 晶振提供 REF_CLK，或由 MCU 输出
+  - 确认 STM32 的 ETH 时钟在 RCC 中已使能
+
+#### 7. 中断状态未清除
+- **错误现象**：PHY 中断只触发一次，不再响应
+- **根本原因**：中断服务函数中没有读取 ISR 寄存器
+- **正确做法**：**每个中断处理都必须读取 ISR**（读即清除），否则 PHY 不会产生下一个中断
+
+---
+
+### C.4 最小硬件清单 (Minimal Hardware Required)
+
+| 组件 | 型号 | 数量 | 预估价格 | 备注 |
+|------|------|------|----------|------|
+| **MCU 开发板** | STM32F407VET6 / STM32F407ZGT6 (淘宝"迷你版") | 1 块 | 30-60 元 | 自带 ETH 接口的型号最佳 |
+| **PHY 模块** | LAN8720A 模块 (淘宝"LAN8720A 网络模块") | 1 块 | 5-10 元 | 带 RJ45 插座的一体模块 |
+| **RJ45 插座** | 带网络变压器的 RJ45 (HR911105A 等) | 1 个 | 3-5 元 | 如模块已集成则不需 |
+| **面包板** | 830 孔面包板 | 1 块 | 5-10 元 | 用于 GPIO 模拟 MDIO |
+| **杜邦线** | 公对母 / 公对公 | 20 根 | 3-5 元 | 不同颜色方便区分 |
+| **网线** | 超五类或六类直通线 | 1 根 | 5-10 元 | 至少 1 米 |
+| **USB-TTL** | CH340G / CP2102 模块 | 1 块 | 5-10 元 | 串口输出调试信息 |
+| **上拉电阻** | 2.2kΩ 电阻 | 1 个 | 0.1 元 | MDIO 上拉 (关键是必须有) |
+| **可选: 交换机** | 百兆/千兆交换机 | 1 台 | 30-50 元 | 测试用对端设备 |
+| **可选: USB 转网口** | USB 转 Ethernet 适配器 | 1 个 | 20-30 元 | 连电脑测试 |
+
+**推荐购买链接**：淘宝搜索关键词 `STM32F407 最小系统板` + `LAN8720A 模块`，总成本约 50-80 元。
+
+**接线图**：
+```
+STM32F407 最小板          LAN8720A 模块 + RJ45
+┌─────────────┐          ┌──────────────┐
+│ PA1 (MDC)   ├─────────►│ MDC          │
+│ PA2 (MDIO)  ├◄────────►│ MDIO         │
+│    3.3V     ├─────────►│ VCC          │
+│    GND      ├─────────►│ GND          │
+│ PC0 (RST)   ├─────────►│ nRST         │
+└─────────────┘          │              │
+                         │   RJ45 接网线│
+                         └──────┬───────┘
+                                │
+                          [交换机/路由器/PC]
+```
+
+**注意**：LAN8720A 模块通常自带 RJ45 座和网络变压器，只需供电和 MDIO 四根线即可通信（但实际收发数据还需要 RMII 接口线）。
+
+---
+
+### C.5 快速参考卡 (Quick Reference Card)
+
+#### IEEE 802.3 标准寄存器 (Clause 22)
+
+| 地址 | 名称 | 读/写 | 关键位 |
+|------|------|-------|--------|
+| 0x00 | BMCR (基本控制) | R/W | bit15=Reset, bit12=ANEG_EN, bit9=Restart ANEG, bit13+6=Speed, bit8=Duplex |
+| 0x01 | BMSR (基本状态) | R | bit2=Link, bit5=ANEG_DONE, bit14-11=能力 (**读两次!**) |
+| 0x02 | PHYIDR1 | R | OUI 高 16 位 |
+| 0x03 | PHYIDR2 | R | OUI 低 6 位 + 型号 + 版本 |
+| 0x04 | ANAR | R/W | 本端发布的能力 (bit5-9, bit10-11=流控) |
+| 0x05 | ANLPAR | R | 对端能力 (格式同 ANAR) |
+| 0x06 | ANER | R | bit0=对端支持 ANEG, bit1=收到新页 |
+| 0x0F | ESTATUS | R | bit15=1000T_FD, bit14=1000T_HD |
+
+#### 常用 PHY 控制值速查
+
+```c
+// BMCR 典型值
+#define BMCR_RESET             0x8000  // 软件复位
+#define BMCR_LOOPBACK          0x4000  // 环回模式
+#define BMCR_100M_FD           0x2100  // 强制 100M 全双工 (不推荐)
+#define BMCR_10M_FD            0x0100  // 强制 10M 全双工
+#define BMCR_AUTONEG           0x1000  // 使能自动协商
+#define BMCR_AUTONEG_RESTART  0x1200  // 使能 + 重启协商
+
+// ANAR 典型值
+#define ANAR_ALL_10_100        0x01E1  // 发布所有 10/100M 能力
+#define ANAR_100FD_ONLY        0x0181  // 只发布 100M 全双工
+#define ANAR_10HD_ONLY         0x0021  // 只发布 10M 半双工
+
+// BMSR 检查
+#define BMSR_CHECK_LINK(bmsr)       ((bmsr >> 2) & 1)
+#define BMSR_CHECK_ANEG_DONE(bmsr)  ((bmsr >> 5) & 1)
+```
+
+#### 快速 MDIO 读写函数 (复制即用)
+
+```c
+// === 最小化 MDIO 驱动 (Cortex-M, GPIO 模拟) ===
+// 只需要实现以下两个函数就能开始调试 PHY:
+
+#define MDIO_DELAY()   { int _d; for(_d=0;_d<10;_d++) __NOP(); }
+
+static void mdc_tick(void) {
+    MDC_GPIO->BSRR = MDC_PIN;     // 时钟高
+    MDIO_DELAY();
+    MDC_GPIO->BSRR = MDC_PIN << 16; // 时钟低
+    MDIO_DELAY();
+}
+
+// 读 PHY 寄存器 (返回值: 16 位数据)
+uint16_t phy_read(uint8_t phy_addr, uint8_t reg) {
+    uint16_t data = 0;
+    // PRE: 32 个 1
+    MDIO_GPIO->MODER |= MDIO_PIN;  // 输出
+    for (int i = 0; i < 32; i++) {
+        MDIO_GPIO->BSRR = MDIO_PIN; mdc_tick();
+    }
+    // 帧: ST(01) + OP(10) + PHYAD(5) + REGAD(5)
+    uint32_t f = (1<<28)|(2<<26)|((phy_addr&31)<<21)|((reg&31)<<16);
+    for (int i = 15; i >= 0; i--) {
+        if (f & (1<<i)) MDIO_GPIO->BSRR = MDIO_PIN;
+        else MDIO_GPIO->BSRR = MDIO_PIN << 16;
+        mdc_tick();
+    }
+    // TA: 高阻 + 采样
+    MDIO_GPIO->MODER &= ~MDIO_PIN;  // 输入
+    mdc_tick(); mdc_tick();
+    // 数据
+    for (int i = 15; i >= 0; i--) {
+        MDIO_GPIO->BSRR = MDC_PIN; MDIO_DELAY();
+        if (MDIO_GPIO->IDR & MDIO_PIN) data |= (1 << i);
+        MDIO_GPIO->BSRR = MDC_PIN << 16; MDIO_DELAY();
+    }
+    return data;
+}
+
+// 写 PHY 寄存器
+void phy_write(uint8_t phy_addr, uint8_t reg, uint16_t data) {
+    MDIO_GPIO->MODER |= MDIO_PIN;  // 输出
+    for (int i = 0; i < 32; i++) {
+        MDIO_GPIO->BSRR = MDIO_PIN; mdc_tick();
+    }
+    uint32_t f = (1<<28)|(1<<26)|((phy_addr&31)<<21)|((reg&31)<<16)
+                |(2<<14)|(data);
+    for (int i = 31; i >= 0; i--) {
+        if (f & (1<<i)) MDIO_GPIO->BSRR = MDIO_PIN;
+        else MDIO_GPIO->BSRR = MDIO_PIN << 16;
+        mdc_tick();
+    }
+}
+```
+
+#### 调试速查
+
+```
+读到 0xFFFF → 检查 MDIO 上拉电阻 (1.5k-2.2k)
+读到 0x0000 → 检查 MDIO GPIO 模式 (应为开漏 OD)
+读 BMSR 异常 → 记得读两次!
+协商失败   → 检查 ANAR 配置 + 等 BMSR.bit5
+中断不触发 → 检查 ISR 是否已读取清除
+```
+
+> **学习建议**：不要跳过任何一个 Day。每个 Day 的代码都是在前一天基础上增加的。把 7 天的代码顺序合并，就是一个小型 PHY 驱动框架。在此基础上再阅读主文档的深入内容，事半功倍。
+
+---
+
 > **参考文档**
 >
 > - IEEE 802.3-2022 Clause 22 (MDIO/MDC Management)

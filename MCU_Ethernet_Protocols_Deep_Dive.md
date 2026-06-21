@@ -3813,3 +3813,1255 @@ uint8_t phy_generic_init(uint8_t phy_addr) {
 ---
 
 > **附注**：本节所有 PHY 寄存器地址和位定义来自 LAN8720A (Microchip/SMSC) 和 DP83848 (TI) 的官方数据手册。不同批次/版本的 PHY 可能在厂商自定义寄存器上存在差异，实际开发中请以对应芯片数据手册为准。Linux PHY 子系统的代码框架参考了内核 `drivers/net/phy/phy.c` 和 `include/linux/phy.h` 的设计思路。
+
+---
+
+## Appendix B: Network Protocol Beginner Learning Path
+
+> 面向 MCU 开发者的网络协议入门学习路径，从字节流视角逐层拆解以太网协议栈，配合 5 个动手实验，帮助零基础开发者快速建立网络协议的核心概念和实践能力。
+
+---
+
+### B.1 前置知识 (Prerequisites)
+
+在开始学习网络协议之前，需要掌握以下基础知识：
+
+**二进制与十六进制流利度**
+网络协议本质上是字节流的结构化排列。常见的数值表示包括：
+- 十六进制表示法：`0x08 0x06` = ARP 的 EtherType，`0x08 0x00` = IPv4 的 EtherType
+- 位操作：`(value >> 12) & 0x0F` 提取高 4 位，`value & 0x0FFF` 提取低 12 位
+- 字节序转换：`0x1234` 在大端序网络中表现为 `0x12 0x34`，在内存中用小端序存储时需翻转
+
+练习：将 `0x8100` 以大端序写入内存的两个字节 -- 结果应为 `{0x81, 0x00}`；将 `0xA0 0x64` 解析为 16 位值 -- 结果应为 `0xA064`。
+
+**基本 C 语言能力**
+- 结构体 (`struct`) 与 `__attribute__((packed))`：网络协议字段往往没有对齐间隙，packed 属性确保结构体布局与线缆上的字节流完全一致
+- 指针 (`*`) 与类型转换 (`(type *)`)：将接收缓冲区强制转换为协议头部结构体指针，直接访问各字段
+- 位运算 (`&`, `|`, `>>`, `<<`)：提取或设置协议头部中的位字段，如 VLAN TCI 中的 PCP、DEI、VID
+- `memcpy()`：复制 MAC 地址等固定长度字段
+
+**网络字节序 (Network Byte Order)**
+- 网络协议使用 **大端序 (Big-Endian, 也称网络序)**：高位字节在前，低位字节在后
+- 主机字节序因 CPU 架构而异：ARM Cortex-M 系列使用小端序
+- 转换宏：`__builtin_bswap16()` / `__builtin_bswap32()` (GCC) 或 `htons()` / `htonl()` / `ntohs()` / `ntohl()` (标准 BSD Socket API)
+- 规则：**多字节字段从网络接收后必须 ntoh 转换，发送前必须 hton 转换**
+
+```c
+// 小端序主机上，从网络接收 2 字节后的正确做法：
+uint8_t raw[2] = {0x08, 0x06};  // 从网线接收的原始字节
+uint16_t ethertype = ((uint16_t)raw[0] << 8) | raw[1];  // 手动拼装 = 0x0806
+// 或将缓冲区强转后 ntohs：
+uint16_t ethertype = ntohs(*(uint16_t *)raw);  // = 0x0806
+```
+
+---
+
+### B.2 协议学习顺序 (Protocol Learning Order)
+
+网络协议的学习应当遵循 **自底向上、逐层递进** 的原则。以下依赖关系图展示了推荐的协议学习路径：
+
+```
+                      ┌─────────────────────────────────────────┐
+                      │         实验室 1: 以太网帧                │
+                      │  (Ethernet Frame -- 一切的基础)           │
+                      └────────────────┬────────────────────────┘
+                                       │
+                                       ▼
+                      ┌─────────────────────────────────────────┐
+                      │         实验室 2: ARP 协议                │
+                      │  (Address Resolution Protocol)           │
+                      └────────────────┬────────────────────────┘
+                                       │
+                                       ▼
+                      ┌─────────────────────────────────────────┐
+                      │         实验室 3: IPv4 + ICMP            │
+                      │  (IP 协议 + Ping 响应)                    │
+                      └────────────────┬────────────────────────┘
+                                       │
+                                       ▼
+                      ┌─────────────────────────────────────────┐
+                      │         实验室 4: UDP 协议                │
+                      │  (UDP Echo Server -- 最简单的传输层)      │
+                      └────────────────┬────────────────────────┘
+                                       │
+                          ┌────────────┴────────────┐
+                          │                         │
+                          ▼                         ▼
+          ┌─────────────────────────┐   ┌─────────────────────────┐
+          │    实验室 5: VLAN       │   │   进阶: TCP 状态机      │
+          │    (802.1Q 标记)         │   │   (三次握手 + 滑动窗口)  │
+          └─────────────────────────┘   └─────────────────────────┘
+```
+
+**学习路径说明**：
+1. 以太网帧是所有上层协议的基础载体，必须先理解帧结构
+2. ARP 是网络层编址的核心协议，解决了"已知 IP 找 MAC"的问题
+3. IPv4 提供跨网络的路由能力，ICMP (Ping) 是最简单的网络层交互
+4. UDP 是无连接的传输层协议，实现最简单，适合初学者
+5. VLAN 在二层扩展网络功能，TCP 实现可靠传输 -- 两条进阶路径可选
+
+---
+
+### B.3 实验室 1：以太网帧深度拆解 (Lab 1: Ethernet Frame Deep Dive)
+
+#### 实验目标
+- 理解以太网帧的逐字节结构
+- 能够从原始字节流中手工解析出每个字段
+- 编写 C 代码实现帧解析打印
+
+#### 以太网帧结构
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                         Preamble (7 字节)                       |
+|                   10101010 重复 7 次                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| SFD |                       目的 MAC 地址                        |
+|10101011|                    (6 字节)                            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                       源 MAC 地址 (6 字节)                       |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         EtherType (2 字节)      |                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+                               |
+|                        Payload (46-1500 字节)                   |
+|                                                               |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        FCS (4 字节)                             |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+**各字段详解**：
+
+| 字段 | 长度 | 说明 | 值示例 |
+|------|------|------|--------|
+| Preamble (前导码) | 7 字节 | 10101010 重复 7 次，用于接收方同步时钟 | `AA AA AA AA AA AA AA` |
+| SFD (帧起始定界符) | 1 字节 | 10101011，标志帧即将开始 | `AB` |
+| Destination MAC (目的 MAC) | 6 字节 | 接收方 MAC 地址 | `FF FF FF FF FF FF` (广播) |
+| Source MAC (源 MAC) | 6 字节 | 发送方 MAC 地址 | `00 11 22 33 44 55` |
+| EtherType (以太类型) | 2 字节 | 指示上层协议类型 | `08 06` (ARP), `08 00` (IPv4) |
+| Payload (数据载荷) | 46-1500 字节 | 上层协议数据 | 可变 |
+| FCS (帧校验序列) | 4 字节 | CRC32 校验，覆盖 MAC 到 Payload | `XX XX XX XX` |
+
+**注意**：Preamble + SFD 共 8 字节由 PHY 硬件添加和移除，软件通常在接收时看不到这两个字段。软件视角的以太网帧从目的 MAC 开始。
+
+#### 带注释的十六进制转储
+
+考虑一个最小 ARP 广播帧：
+
+```
+FF FF FF FF FF FF     ← 目的 MAC：广播地址 (6 字节)
+00 11 22 33 44 55     ← 源 MAC：00-11-22-33-44-55 (6 字节)
+08 06                 ← EtherType：0x0806 = ARP (2 字节)
+00 01                 ← ARP HTYPE：以太网 (2 字节)
+08 00                 ← ARP PTYPE：IPv4 (2 字节)
+06                    ← HLEN：MAC 地址长度 6 (1 字节)
+04                    ← PLEN：IP 地址长度 4 (1 字节)
+00 01                 ← OPER：1 = 请求 (2 字节)
+00 11 22 33 44 55     ← SHA：发送方 MAC (6 字节)
+C0 A8 01 64           ← SPA：发送方 IP = 192.168.1.100 (4 字节)
+00 00 00 00 00 00     ← THA：目标 MAC = 0 (未知，6 字节)
+C0 A8 01 01           ← TPA：目标 IP = 192.168.1.1 (4 字节)
+00 00 00 00 00 00...  ← 填充位 (Pad) 使帧达到 64 字节
+XX XX XX XX           ← FCS：CRC32 (4 字节)
+```
+
+#### C 代码：以太网帧解析器
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+/* 以太网帧头结构 (14 字节，不含 Preamble/SFD/FCS) */
+typedef struct __attribute__((packed)) {
+    uint8_t  dst_mac[6];     /* 目的 MAC */
+    uint8_t  src_mac[6];     /* 源 MAC */
+    uint16_t ethertype;      /* EtherType (网络字节序) */
+} eth_header_t;
+
+/* 常用 EtherType */
+#define ETHTYPE_IPV4  0x0800
+#define ETHTYPE_ARP   0x0806
+#define ETHTYPE_VLAN  0x8100
+#define ETHTYPE_IPV6  0x86DD
+#define ETHTYPE_PAUSE 0x8808
+#define ETHTYPE_LLDP  0x88CC
+
+/* MAC 地址转字符串 */
+void mac_to_str(const uint8_t mac[6], char *str, int str_len) {
+    if (str_len < 18) return;
+    snprintf(str, str_len, "%02X-%02X-%02X-%02X-%02X-%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+/* 解析并打印以太网帧头 */
+void eth_frame_print(const uint8_t *frame, int frame_len) {
+    if (frame_len < 14) {
+        printf("Frame too short: %d bytes (minimum 14)\r\n", frame_len);
+        return;
+    }
+
+    const eth_header_t *eth = (const eth_header_t *)frame;
+    char mac_str[18];
+
+    mac_to_str(eth->dst_mac, mac_str, sizeof(mac_str));
+    printf("Destination MAC : %s\r\n", mac_str);
+
+    mac_to_str(eth->src_mac, mac_str, sizeof(mac_str));
+    printf("Source MAC      : %s\r\n", mac_str);
+
+    /* EtherType 是网络字节序，需要转换为本地字节序 */
+    uint16_t etype = __builtin_bswap16(eth->ethertype);
+    printf("EtherType       : 0x%04X ", etype);
+
+    switch (etype) {
+    case ETHTYPE_IPV4:  printf("(IPv4)\r\n");  break;
+    case ETHTYPE_ARP:   printf("(ARP)\r\n");   break;
+    case ETHTYPE_VLAN:  printf("(802.1Q VLAN)\r\n"); break;
+    case ETHTYPE_IPV6:  printf("(IPv6)\r\n");  break;
+    case ETHTYPE_LLDP:  printf("(LLDP)\r\n");  break;
+    case ETHTYPE_PAUSE: printf("(MAC Control/Pause)\r\n"); break;
+    default:            printf("(Unknown/LLC)\r\n"); break;
+    }
+
+    /* 判断是否为广播帧 */
+    uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    if (memcmp(eth->dst_mac, broadcast_mac, 6) == 0) {
+        printf("  -> Broadcast frame\r\n");
+    }
+
+    /* 判断是否为组播帧 (MAC 第 1 字节最低位 = 1) */
+    if (eth->dst_mac[0] & 0x01) {
+        printf("  -> Multicast frame\r\n");
+    }
+
+    int payload_len = frame_len - 14;
+    printf("Payload length  : %d bytes\r\n", payload_len);
+
+    /* 打印前 16 字节 payload 的 hex dump */
+    if (payload_len > 0) {
+        printf("Payload hex     :");
+        int dump_len = (payload_len > 16) ? 16 : payload_len;
+        for (int i = 0; i < dump_len; i++) {
+            if (i % 8 == 0) printf(" ");
+            printf(" %02X", frame[14 + i]);
+        }
+        printf("\r\n");
+    }
+}
+```
+
+#### 动手练习 (Step-by-Step)
+
+1. 用手工解析以下 hex 转储，写出每个字段的值：
+   ```
+   FF FF FF FF FF FF 00 0A 95 9D 68 18 08 06
+   ```
+   (答案：dstMAC=FF:FF:FF:FF:FF:FF, srcMAC=00:0A:95:9D:68:18, EtherType=0x0806=ARP)
+
+2. 使用 Wireshark 捕获一个真实以太网帧，对比软件输出与 Wireshark 解析结果
+
+3. 修改 `eth_frame_print` 函数，增加对 802.1Q VLAN 帧的检测（EtherType=0x8100 时打印 "VLAN tagged"）
+
+---
+
+### B.4 实验室 2：构建 ARP 请求 (Lab 2: Build an ARP Request)
+
+#### 实验目标
+- 理解 ARP 协议的消息结构
+- 手动构建并发送 ARP 请求帧
+- 解析 ARP 应答，提取对端 MAC 地址
+- 实现一个简单的 ARP 缓存表
+
+#### ARP 协议结构
+
+ARP (Address Resolution Protocol) 用于将 IP 地址解析为 MAC 地址。ARP 报文直接封装在以太网帧中，EtherType = `0x0806`。
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|        Hardware Type (HTYPE)    |       Protocol Type (PTYPE)  |
+|             0x0001 (Ethernet)   |          0x0800 (IPv4)      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| HLEN  | PLEN  |         Operation (OPER)                      |
+| 0x06  | 0x04  |     0x0001=Request, 0x0002=Reply             |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                Sender Hardware Address (SHA, 6 字节)          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                Sender Protocol Address (SPA, 4 字节)          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                Target Hardware Address (THA, 6 字节)          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                Target Protocol Address (TPA, 4 字节)          |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+ARP 报文共 28 字节（不含以太网头部）：
+
+| 字段 | 长度 | 说明 | ARP 请求示例 | ARP 应答示例 |
+|------|------|------|-------------|-------------|
+| HTYPE | 2 字节 | 硬件类型，以太网=1 | `00 01` | `00 01` |
+| PTYPE | 2 字节 | 协议类型，IPv4=0x0800 | `08 00` | `08 00` |
+| HLEN | 1 字节 | 硬件地址长度，MAC=6 | `06` | `06` |
+| PLEN | 1 字节 | 协议地址长度，IPv4=4 | `04` | `04` |
+| OPER | 2 字节 | 操作码，1=请求，2=应答 | `00 01` | `00 02` |
+| SHA | 6 字节 | 发送方 MAC | 本机 MAC | 本机 MAC |
+| SPA | 4 字节 | 发送方 IP | 本机 IP | 本机 IP |
+| THA | 6 字节 | 目标 MAC（请求中为 0） | `00 00 00 00 00 00` | 对端 MAC |
+| TPA | 4 字节 | 目标 IP | 目标 IP | 目标 IP |
+
+#### 完整的 ARP 请求构建器
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+/* 以太网帧头 */
+typedef struct __attribute__((packed)) {
+    uint8_t  dst_mac[6];
+    uint8_t  src_mac[6];
+    uint16_t ethertype;  /* 0x0806 */
+} eth_header_t;
+
+/* ARP 报文 (28 字节) */
+typedef struct __attribute__((packed)) {
+    uint16_t htype;       /* 硬件类型 */
+    uint16_t ptype;       /* 协议类型 */
+    uint8_t  hlen;        /* 硬件地址长度 */
+    uint8_t  plen;        /* 协议地址长度 */
+    uint16_t oper;        /* 操作码 */
+    uint8_t  sha[6];      /* 发送方 MAC */
+    uint8_t  spa[4];      /* 发送方 IP */
+    uint8_t  tha[6];      /* 目标 MAC */
+    uint8_t  tpa[4];      /* 目标 IP */
+} arp_packet_t;
+
+#define ARP_HTYPE_ETHERNET 1
+#define ARP_PTYPE_IPV4     0x0800
+#define ARP_OP_REQUEST     1
+#define ARP_OP_REPLY       2
+
+/* 广播 MAC */
+static const uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+/**
+ * 构建 ARP 请求帧
+ * buffer:   输出缓冲区 (至少 42 字节: 14 + 28)
+ * src_mac:  本机 MAC 地址
+ * src_ip:   本机 IP 地址 (网络字节序)
+ * target_ip: 目标 IP 地址 (网络字节序)
+ * 返回: 帧总长度 (42 字节以太网帧头 + ARP，不含 FCS)
+ */
+int arp_build_request(uint8_t *buffer,
+                      const uint8_t src_mac[6],
+                      uint32_t src_ip,
+                      uint32_t target_ip) {
+    eth_header_t *eth = (eth_header_t *)buffer;
+    arp_packet_t *arp = (arp_packet_t *)(buffer + sizeof(eth_header_t));
+
+    /* ---- 填充以太网头部 ---- */
+    memcpy(eth->dst_mac, broadcast_mac, 6);    /* 广播到所有设备 */
+    memcpy(eth->src_mac, src_mac, 6);           /* 本机 MAC */
+    eth->ethertype = __builtin_bswap16(0x0806); /* ARP EtherType */
+
+    /* ---- 填充 ARP 报文 ---- */
+    arp->htype = __builtin_bswap16(ARP_HTYPE_ETHERNET); /* 以太网 */
+    arp->ptype = __builtin_bswap16(ARP_PTYPE_IPV4);     /* IPv4 */
+    arp->hlen  = 6;                           /* MAC 地址长度 */
+    arp->plen  = 4;                           /* IP 地址长度 */
+    arp->oper  = __builtin_bswap16(ARP_OP_REQUEST); /* 请求 */
+
+    /* TODO: 填写发送方硬件地址 (本机 MAC) */
+    memcpy(arp->sha, src_mac, 6);
+
+    /* TODO: 填写发送方协议地址 (本机 IP) */
+    arp->spa[0] = (src_ip >> 24) & 0xFF;  /* 或者直接 memcpy */
+    arp->spa[1] = (src_ip >> 16) & 0xFF;
+    arp->spa[2] = (src_ip >> 8) & 0xFF;
+    arp->spa[3] = src_ip & 0xFF;
+
+    /* TODO: 填写目标硬件地址 (未知，填 0) */
+    memset(arp->tha, 0, 6);
+
+    /* TODO: 填写目标协议地址 (要查询的 IP) */
+    arp->tpa[0] = (target_ip >> 24) & 0xFF;
+    arp->tpa[1] = (target_ip >> 16) & 0xFF;
+    arp->tpa[2] = (target_ip >> 8) & 0xFF;
+    arp->tpa[3] = target_ip & 0xFF;
+
+    return sizeof(eth_header_t) + sizeof(arp_packet_t);
+}
+
+/**
+ * 解析 ARP 应答
+ * buffer: 接收到的完整帧 (以太网头 + ARP)
+ * len:    帧长度
+ * peer_mac: 输出参数，对端的 MAC 地址
+ * 返回: 1=有效ARP应答, 0=非ARP应答或ARP请求
+ */
+int arp_parse_reply(const uint8_t *buffer, int len, uint8_t peer_mac[6]) {
+    if (len < (int)(sizeof(eth_header_t) + sizeof(arp_packet_t))) {
+        return 0;
+    }
+
+    const eth_header_t *eth = (const eth_header_t *)buffer;
+    const arp_packet_t *arp = (const arp_packet_t *)(buffer + sizeof(eth_header_t));
+
+    /* 检查 EtherType */
+    if (__builtin_bswap16(eth->ethertype) != 0x0806) return 0;
+
+    /* 检查是否为 ARP 应答 (oper=2) */
+    if (__builtin_bswap16(arp->oper) != ARP_OP_REPLY) return 0;
+
+    /* 提取对端的 MAC 地址 (发送方硬件地址) */
+    memcpy(peer_mac, arp->sha, 6);
+    return 1;
+}
+
+/**
+ * 打印 ARP 报文内容 (调试用)
+ */
+void arp_print(const uint8_t *buffer, int len) {
+    if (len < (int)(sizeof(eth_header_t) + sizeof(arp_packet_t))) {
+        printf("ARP packet too short\r\n");
+        return;
+    }
+
+    const arp_packet_t *arp = (const arp_packet_t *)(buffer + sizeof(eth_header_t));
+    uint16_t oper = __builtin_bswap16(arp->oper);
+
+    printf("ARP %s:\r\n", (oper == ARP_OP_REQUEST) ? "Request" : "Reply");
+    printf("  Sender MAC : %02X-%02X-%02X-%02X-%02X-%02X\r\n",
+           arp->sha[0], arp->sha[1], arp->sha[2],
+           arp->sha[3], arp->sha[4], arp->sha[5]);
+    printf("  Sender IP  : %d.%d.%d.%d\r\n",
+           arp->spa[0], arp->spa[1], arp->spa[2], arp->spa[3]);
+    printf("  Target MAC : %02X-%02X-%02X-%02X-%02X-%02X\r\n",
+           arp->tha[0], arp->tha[1], arp->tha[2],
+           arp->tha[3], arp->tha[4], arp->tha[5]);
+    printf("  Target IP  : %d.%d.%d.%d\r\n",
+           arp->tpa[0], arp->tpa[1], arp->tpa[2], arp->tpa[3]);
+}
+```
+
+#### 简单的 ARP 缓存实现
+
+```c
+#define ARP_CACHE_SIZE 8
+
+typedef struct {
+    uint32_t ip_addr;          /* IP 地址 (网络字节序) */
+    uint8_t  mac_addr[6];      /* MAC 地址 */
+    uint32_t timestamp_ticks;  /* 记录时间戳 (ticks) */
+    uint8_t  valid;            /* 是否有效 */
+} arp_cache_entry_t;
+
+typedef struct {
+    arp_cache_entry_t entries[ARP_CACHE_SIZE];
+    int               count;
+} arp_cache_t;
+
+void arp_cache_init(arp_cache_t *cache) {
+    memset(cache, 0, sizeof(arp_cache_t));
+}
+
+/**
+ * 在 ARP 缓存中查找 IP 对应的 MAC
+ * 返回: 1=找到, 0=未找到
+ */
+int arp_cache_lookup(arp_cache_t *cache, uint32_t ip, uint8_t mac[6]) {
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (cache->entries[i].valid &&
+            cache->entries[i].ip_addr == ip) {
+            memcpy(mac, cache->entries[i].mac_addr, 6);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * 更新 ARP 缓存 (从 ARP 应答中学习)
+ */
+void arp_cache_update(arp_cache_t *cache, uint32_t ip, const uint8_t mac[6]) {
+    /* 查找是否已有该 IP 的表项 */
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (cache->entries[i].valid &&
+            cache->entries[i].ip_addr == ip) {
+            memcpy(cache->entries[i].mac_addr, mac, 6);
+            cache->entries[i].timestamp_ticks = 0;
+            return;
+        }
+    }
+
+    /* 分配新表项 (覆盖最旧的) */
+    int oldest = 0;
+    for (int i = 1; i < ARP_CACHE_SIZE; i++) {
+        if (!cache->entries[i].valid) { oldest = i; break; }
+        if (cache->entries[i].timestamp_ticks >
+            cache->entries[oldest].timestamp_ticks) {
+            oldest = i;
+        }
+    }
+
+    cache->entries[oldest].ip_addr = ip;
+    memcpy(cache->entries[oldest].mac_addr, mac, 6);
+    cache->entries[oldest].timestamp_ticks = 0;
+    cache->entries[oldest].valid = 1;
+}
+
+/* ARP 缓存老化 (每秒调用一次) */
+void arp_cache_tick(arp_cache_t *cache) {
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (!cache->entries[i].valid) continue;
+        cache->entries[i].timestamp_ticks++;
+        /* ARP 缓存条目 300 秒后过期 (RFC 1122 建议) */
+        if (cache->entries[i].timestamp_ticks > 300) {
+            cache->entries[i].valid = 0;
+        }
+    }
+}
+```
+
+#### ARP 工作流程 (动手理解)
+
+1. **主机 A (192.168.1.100, MAC=00:11:22:33:44:55)** 需要向 **主机 B (192.168.1.1)** 发送数据
+2. 主机 A 检查 ARP 缓存，未找到 192.168.1.1 对应的 MAC
+3. 主机 A 构造 ARP 请求：
+   - 以太网帧：dst=FF:FF:FF:FF:FF:FF (广播), src=00:11:22:33:44:55, EtherType=0x0806
+   - ARP：OPER=1, SHA=00:11:22:33:44:55, SPA=192.168.1.100, THA=00:00:00:00:00:00, TPA=192.168.1.1
+4. 交换机广播该帧到所有端口
+5. 主机 B (192.168.1.1) 收到后，发现 TPA 是自己的 IP，发送 ARP 应答：
+   - 以太网帧：dst=00:11:22:33:44:55 (单播), src=主机B的MAC, EtherType=0x0806
+   - ARP：OPER=2, SHA=主机B的MAC, SPA=192.168.1.1, THA=00:11:22:33:44:55, TPA=192.168.1.100
+6. 主机 A 收到应答，提取 SHA 得到主机 B 的 MAC，存入 ARP 缓存
+
+#### 动手练习
+
+1. 在纸上手写构建一个 ARP 请求：本机 MAC=00:11:22:33:44:55, 本机 IP=10.0.0.2, 目标 IP=10.0.0.1。写出完整的 42 字节十六进制值
+2. 用 `arp_build_request()` 构建请求帧，假设底层有 `emac_send_frame(buffer, len)` 发送函数
+3. 在接收回调中调用 `arp_parse_reply()` 提取对端 MAC，再调用 `arp_cache_update()` 存入缓存
+4. 思考题：ARP 应答为什么用单播而不用广播？
+
+---
+
+### B.5 实验室 3：响应 Ping (ICMP Echo)
+
+#### 实验目标
+- 理解 IP 头部结构
+- 理解 ICMP 协议 (Echo Request / Echo Reply)
+- 实现从接收 Ping 请求到发送 Ping 响应的完整链路
+- 掌握 IP 和 ICMP 校验和计算方法
+
+#### 协议层次回顾
+
+一个完整的 Ping 请求帧包含三个协议层：
+
+```
++-------------------+     +----------------------------+     +-------------------+
+| 以太网帧头 (14B)   | --> | IP 头部 (20B, 无选项)       | --> | ICMP Echo Request |
+| dstMAC|srcMAC|0x0800|    | ver=4, proto=1, ...        |    | type=8, ...       |
++-------------------+     +----------------------------+     +-------------------+
+```
+
+#### 实现原理
+
+响应 Ping 的步骤：
+1. 接收帧，检查 EtherType = 0x0800 (IPv4)
+2. 解析 IP 头部，检查 Protocol 字段 = 1 (ICMP)
+3. 跳过 IP 头部，检查 ICMP Type = 8 (Echo Request)
+4. **交换** 源和目的 MAC 地址
+5. **交换** 源和目的 IP 地址
+6. 将 ICMP Type 从 8 改为 0 (Echo Reply)
+7. 将 ICMP Code 置为 0
+8. 重新计算 ICMP 校验和
+9. 重新计算 IP 头部校验和
+10. 发送新帧
+
+#### 完整 C 代码实现
+
+```c
+#include <stdint.h>
+#include <string.h>
+
+/* 以太网帧头 */
+typedef struct __attribute__((packed)) {
+    uint8_t  dst_mac[6];
+    uint8_t  src_mac[6];
+    uint16_t ethertype;
+} eth_header_t;
+
+/* IP 头部 (20 字节，无选项) */
+typedef struct __attribute__((packed)) {
+    uint8_t  ver_ihl;          /* 版本(4) + 头部长度(4, 单位4字节) */
+    uint8_t  dscp_ecn;         /* 差分服务 + 显式拥塞通知 */
+    uint16_t total_length;     /* 总长度 (包括头部) */
+    uint16_t identification;   /* 标识 */
+    uint16_t flags_offset;     /* 标志(3) + 片偏移(13) */
+    uint8_t  ttl;              /* 生存时间 */
+    uint8_t  protocol;         /* 协议 (1=ICMP, 6=TCP, 17=UDP) */
+    uint16_t checksum;         /* 头部校验和 */
+    uint8_t  src_ip[4];        /* 源 IP */
+    uint8_t  dst_ip[4];        /* 目的 IP */
+} ip_header_t;
+
+/* ICMP 头部 (4 字节 + 可选数据) */
+typedef struct __attribute__((packed)) {
+    uint8_t  type;             /* 8=Echo Request, 0=Echo Reply */
+    uint8_t  code;             /* 对 Echo 为 0 */
+    uint16_t checksum;         /* ICMP 校验和 (覆盖整个 ICMP 报文) */
+    uint16_t identifier;       /* 标识符 (用于匹配请求/回复) */
+    uint16_t sequence_num;     /* 序列号 */
+} icmp_header_t;
+
+/* 协议常量 */
+#define IP_PROTO_ICMP  1
+#define ICMP_TYPE_ECHO_REQUEST 8
+#define ICMP_TYPE_ECHO_REPLY   0
+
+/**
+ * 计算 Internet 校验和 (RFC 1071)
+ * 以 16 位为单位的反码求和
+ */
+uint16_t internet_checksum(const uint8_t *data, int len) {
+    uint32_t sum = 0;
+    const uint16_t *p = (const uint16_t *)data;
+
+    while (len >= 2) {
+        sum += __builtin_bswap16(*p++);
+        if (sum & 0x80000000) sum = (sum & 0xFFFF) + (sum >> 16);
+        len -= 2;
+    }
+
+    /* 如果有奇数个字节，补 0 继续累加 */
+    if (len == 1) {
+        sum += __builtin_bswap16((uint16_t)(*(const uint8_t *)p) << 8);
+    }
+
+    /* 进位折叠 */
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    return (uint16_t)(~sum & 0xFFFF);
+}
+
+/**
+ * 设置 IP 头部校验和 (校验和字段先置 0)
+ */
+void ip_set_checksum(ip_header_t *ip) {
+    ip->checksum = 0;
+    ip->checksum = internet_checksum((uint8_t *)ip, 20);
+}
+
+/**
+ * 处理接收到的 Ping 请求并构建响应
+ * rx_buffer: 接收到的完整帧 (将被原地修改为响应帧)
+ * rx_len:    接收到的帧长度
+ * 返回: 响应帧长度 (0=不是 Ping 请求)
+ */
+int icmp_handle_ping(uint8_t *rx_buffer, int rx_len) {
+    if (rx_len < (int)(sizeof(eth_header_t) + sizeof(ip_header_t) +
+                         sizeof(icmp_header_t))) {
+        return 0; /* 帧太短 */
+    }
+
+    eth_header_t *eth = (eth_header_t *)rx_buffer;
+    ip_header_t  *ip  = (ip_header_t  *)(rx_buffer + sizeof(eth_header_t));
+
+    /* 步骤 1: 检查 EtherType */
+    if (__builtin_bswap16(eth->ethertype) != 0x0800) return 0;
+
+    /* 步骤 2: 检查 IP 协议 */
+    if (ip->protocol != IP_PROTO_ICMP) return 0;
+
+    /* 步骤 3: 计算 IP 头部长度 */
+    int ip_hdr_len = (ip->ver_ihl & 0x0F) * 4;
+    if (ip_hdr_len < 20) return 0;
+
+    /* 步骤 4: 指向 ICMP 头部 */
+    icmp_header_t *icmp = (icmp_header_t *)(rx_buffer +
+                                             sizeof(eth_header_t) + ip_hdr_len);
+
+    /* 步骤 5: 检查是否是 Echo Request */
+    if (icmp->type != ICMP_TYPE_ECHO_REQUEST) return 0;
+    if (icmp->code != 0) return 0;
+
+    /* 步骤 6: 交换 MAC 地址 */
+    uint8_t temp_mac[6];
+    memcpy(temp_mac, eth->dst_mac, 6);
+    memcpy(eth->dst_mac, eth->src_mac, 6);
+    memcpy(eth->src_mac, temp_mac, 6);
+
+    /* 步骤 7: 交换 IP 地址 */
+    uint8_t temp_ip[4];
+    memcpy(temp_ip, ip->dst_ip, 4);
+    memcpy(ip->dst_ip, ip->src_ip, 4);
+    memcpy(ip->src_ip, temp_ip, 4);
+
+    /* 步骤 8: 修改 ICMP 类型为 Echo Reply */
+    icmp->type = ICMP_TYPE_ECHO_REPLY;
+    icmp->code = 0;
+
+    /* 步骤 9: 重新计算 ICMP 校验和 */
+    /* ICMP 报文长度 = IP 总长度 - IP 头部长度 */
+    int icmp_len = __builtin_bswap16(ip->total_length) - ip_hdr_len;
+    icmp->checksum = 0;
+    icmp->checksum = internet_checksum((uint8_t *)icmp, icmp_len);
+
+    /* 步骤 10: 重新计算 IP 头部校验和 */
+    ip_set_checksum(ip);
+
+    /* 步骤 11: 返回响应帧长度 (与接收帧相同) */
+    return rx_len;
+}
+```
+
+#### 动手练习
+
+1. 理解为什么 ICMP 校验和覆盖整个 ICMP 报文（包括 Identifier 和 Sequence Number 以及后面的 Payload 数据），而 IP 校验和只覆盖 IP 头部
+2. 修改代码，使其支持 Ping 请求中携带自定义数据的场景（标准 Ping 通常会发送 56 字节的填充数据）
+3. 思考：如果需要同时支持 Ping 响应和 Ping 请求（即你的设备也可以主动发起 Ping），代码应该怎么组织？
+4. 验证：用 Wireshark 捕获 PC ping MCU 的报文，观察请求和响应的字节差异
+
+---
+
+### B.6 实验室 4：UDP Echo 服务器 (Lab 4: UDP Echo Server)
+
+#### 实验目标
+- 理解 UDP 头部结构
+- 实现一个简单的 UDP Echo 服务器（收到什么数据就原样返回）
+- 掌握 MAC、IP、UDP 三层的地址交换
+
+#### UDP 头部结构
+
+UDP (User Datagram Protocol) 提供无连接的传输层服务，头部仅 8 字节：
+
+```
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|         源端口 (Src Port)       |       目的端口 (Dst Port)      |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|             UDP 长度 (Length)    |          UDP 校验和 (Checksum) |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+| 字段 | 长度 | 说明 |
+|------|------|------|
+| 源端口 | 2 字节 | 发送方端口 (客户端随机分配，如 49152) |
+| 目的端口 | 2 字节 | 接收方端口 (如 DHCP=67, DNS=53, Echo=7) |
+| UDP 长度 | 2 字节 | UDP 头部 + 数据的字节数 (最小 8) |
+| UDP 校验和 | 2 字节 | 覆盖 UDP 伪头部 + 头部 + 数据 (可选在 IPv4 中) |
+
+#### 协议层次回顾
+
+一个完整的 UDP 数据报封装在 IP 和以太网中：
+
+```
++-------------------+     +----------------------------+     +-------------------+
+| 以太网帧头 (14B)   | --> | IP 头部 (20B, 无选项)       | --> | UDP 头部 (8B)      |
+| dstMAC|srcMAC|0x0800|    | ver=4, proto=17(UDP), ...  |    | srcport|dstport|len|chk|
++-------------------+     +----------------------------+     +-------------------+
+                                                                    |
+                                                                    v
+                                                               +-----------+
+                                                               | Payload   |
+                                                               | (可变长度)  |
+                                                               +-----------+
+```
+
+#### 完整 C 代码：UDP Echo Server
+
+```c
+#include <stdint.h>
+#include <string.h>
+
+/* UDP 头部 (8 字节) */
+typedef struct __attribute__((packed)) {
+    uint16_t src_port;       /* 源端口 */
+    uint16_t dst_port;       /* 目的端口 */
+    uint16_t length;         /* UDP 头部 + 数据长度 */
+    uint16_t checksum;       /* UDP 校验和 */
+} udp_header_t;
+
+#define IP_PROTO_UDP 17
+
+extern void emac_send_frame(const uint8_t *frame, int len);
+
+/**
+ * UDP Echo Server 处理函数
+ * 收到 UDP 报文后，交换 MAC/IP/端口，原样返回 payload
+ *
+ * 典型用例：PC 上运行 netcat:
+ *   echo "Hello" | nc -u -p 12345 <MCU_IP> 7
+ * 或 Python:
+ *   import socket; s=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+ *   s.sendto(b"Hello", ("<MCU_IP>", 7))
+ *
+ * rx_buffer: 接收到的完整帧 (将被原地修改)
+ * rx_len:    接收帧长度
+ * 返回: 1=已发送UDP Echo响应, 0=不是UDP包
+ */
+int udp_echo_server(uint8_t *rx_buffer, int rx_len) {
+    if (rx_len < (int)(sizeof(eth_header_t) + sizeof(ip_header_t) +
+                         sizeof(udp_header_t))) {
+        return 0;
+    }
+
+    eth_header_t *eth = (eth_header_t *)rx_buffer;
+    ip_header_t  *ip  = (ip_header_t  *)(rx_buffer + sizeof(eth_header_t));
+
+    /* 检查 EtherType */
+    if (__builtin_bswap16(eth->ethertype) != 0x0800) return 0;
+
+    /* 计算 IP 头部长度 */
+    int ip_hdr_len = (ip->ver_ihl & 0x0F) * 4;
+    if (ip_hdr_len < 20) return 0;
+
+    /* 检查 IP 协议 */
+    if (ip->protocol != IP_PROTO_UDP) return 0;
+
+    /* 指向 UDP 头部 */
+    udp_header_t *udp = (udp_header_t *)(rx_buffer +
+                                          sizeof(eth_header_t) + ip_hdr_len);
+
+    /* 交换 MAC 地址 */
+    uint8_t temp_mac[6];
+    memcpy(temp_mac, eth->dst_mac, 6);
+    memcpy(eth->dst_mac, eth->src_mac, 6);
+    memcpy(eth->src_mac, temp_mac, 6);
+
+    /* 交换 IP 地址 */
+    uint8_t temp_ip[4];
+    memcpy(temp_ip, ip->dst_ip, 4);
+    memcpy(ip->dst_ip, ip->src_ip, 4);
+    memcpy(ip->src_ip, temp_ip, 4);
+
+    /* 交换 UDP 端口 (源端口 ↔ 目的端口) */
+    uint16_t temp_port = udp->src_port;
+    udp->src_port = udp->dst_port;
+    udp->dst_port = temp_port;
+
+    /* UDP 长度不变 (原样返回同样的 payload) */
+
+    /* 重新计算 IP 头部校验和 */
+    ip->checksum = 0;
+    ip->checksum = internet_checksum((uint8_t *)ip, ip_hdr_len);
+
+    /* 重新计算 UDP 校验和 */
+    /* 注意：UDP 校验和包含伪头部 (src_ip + dst_ip + 0 + proto + udp_len) */
+    udp->checksum = 0;  /* 设置为 0 表示校验和未计算 (IPv4 允许) */
+    /* 为符合规范，最好正确计算，这里因篇幅暂略 */
+
+    /* 发送响应 (与接收帧同长度) */
+    emac_send_frame(rx_buffer, rx_len);
+
+    return 1;
+}
+```
+
+#### UDP 校验和计算（伪头部）
+
+UDP 校验和与 TCP 校验和类似，包含一个 **伪头部 (Pseudo Header)**，用于验证数据报是否到达了正确的主机和端口：
+
+```c
+/**
+ * 计算 UDP 校验和 (包含伪头部)
+ * buf:      UDP 头部 + 数据的起始地址
+ * udp_len:  UDP 头部 + 数据的长度
+ * src_ip:   源 IP (网络字节序)
+ * dst_ip:   目的 IP (网络字节序)
+ */
+uint16_t udp_checksum_calc(const uint8_t *buf, int udp_len,
+                           uint32_t src_ip, uint32_t dst_ip) {
+    uint32_t sum = 0;
+    int i;
+
+    /* 伪头部 (12 字节) */
+    uint8_t pseudo[12];
+    /* 源 IP */
+    pseudo[0]  = (src_ip >> 24) & 0xFF;
+    pseudo[1]  = (src_ip >> 16) & 0xFF;
+    pseudo[2]  = (src_ip >> 8) & 0xFF;
+    pseudo[3]  = src_ip & 0xFF;
+    /* 目的 IP */
+    pseudo[4]  = (dst_ip >> 24) & 0xFF;
+    pseudo[5]  = (dst_ip >> 16) & 0xFF;
+    pseudo[6]  = (dst_ip >> 8) & 0xFF;
+    pseudo[7]  = dst_ip & 0xFF;
+    /* 保留 (1 字节) + 协议 (1 字节) */
+    pseudo[8]  = 0;
+    pseudo[9]  = IP_PROTO_UDP;
+    /* UDP 长度 */
+    pseudo[10] = (udp_len >> 8) & 0xFF;
+    pseudo[11] = udp_len & 0xFF;
+
+    /* 累加伪头部 */
+    for (i = 0; i < 12; i += 2) {
+        sum += ((uint16_t)pseudo[i] << 8) | pseudo[i + 1];
+    }
+
+    /* 累加 UDP 头部 + 数据 */
+    const uint16_t *p = (const uint16_t *)buf;
+    int remaining = udp_len;
+    while (remaining > 1) {
+        sum += *p++;
+        remaining -= 2;
+    }
+    if (remaining == 1) {
+        sum += (uint16_t)(*(const uint8_t *)p) << 8;
+    }
+
+    /* 进位折叠 */
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    return (uint16_t)(~sum & 0xFFFF);
+}
+```
+
+#### 动手练习
+
+1. 用 netcat 测试 UDP Echo 服务器：`echo "Hello" | nc -u <MCU_IP> 7`，看是否能收到回显
+2. 思考：为什么 `udp->checksum = 0` 可以工作？IPv4 对 UDP 校验和有什么特殊规定？
+3. 扩展练习：将 UDP Echo 服务器改为只响应特定端口（如 8888），其他端口丢弃
+
+---
+
+### B.7 实验室 5：VLAN 标记 (Lab 5: VLAN Tagging)
+
+#### 实验目标
+- 理解 802.1Q VLAN Tag 的结构
+- 实现 VLAN Tag 的插入和移除
+- 理解 tagged 帧与 untagged 帧的区别
+
+#### VLAN Tag 结构回顾
+
+802.1Q Tag 是 4 字节的字段，插入在源 MAC 和 EtherType 之间：
+
+```
+原始以太网帧:
++----------------+----------------+----------+------------------+
+|  Dst MAC (6B)  |  Src MAC (6B)  | EtherType|   Payload       |
+|                |                |  (2B)    |   (46-1500B)    |
++----------------+----------------+----------+------------------+
+
+带 802.1Q Tag:
++----------------+----------------+----------+----------+-------+
+|  Dst MAC (6B)  |  Src MAC (6B)  | Tag(4B)  | EtherType|Payload|
+|                |                |0x8100|TCI|  (2B)    |       |
++----------------+----------------+----------+----------+-------+
+```
+
+Tag 内部结构 (4 字节)：
+```
+ 0                   1                   2                   3
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|     TPID (0x8100)              |PCP(3)|DEI(1)|  VID (12)     |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+```
+
+- **TPID (16 位)** = `0x8100`，标志这是一个 802.1Q 帧
+- **PCP (3 位)** = 优先级，0-7，7=最高
+- **DEI (1 位)** = 是否可丢弃 (Drop Eligible Indicator)
+- **VID (12 位)** = VLAN ID，1-4094
+
+#### C 代码：VLAN Tag 插入和移除
+
+```c
+#include <stdint.h>
+#include <string.h>
+
+#define VLAN_TPID 0x8100
+
+/**
+ * 构建 VLAN TCI 值
+ * pcp: 优先级 (0-7)
+ * dei: 丢弃指示 (0-1)
+ * vid: VLAN ID (0-4094)
+ * 返回: 网络字节序的 TCI
+ */
+static inline uint16_t vlan_make_tci(uint8_t pcp, uint8_t dei, uint16_t vid) {
+    uint16_t tci = ((uint16_t)(pcp & 0x07) << 13) |
+                   ((uint16_t)(dei & 0x01) << 12) |
+                   (vid & 0x0FFF);
+    return __builtin_bswap16(tci);
+}
+
+/**
+ * 插入 VLAN Tag
+ *
+ * 假设 buffer 布局 (插入前):
+ *   [0-5] = dst_mac, [6-11] = src_mac, [12-13] = EtherType, [14+] = payload
+ *
+ * 插入后:
+ *   [0-5] = dst_mac, [6-11] = src_mac,
+ *   [12-13] = TPID (0x8100), [14-15] = TCI,
+ *   [16-17] = 原 EtherType, [18+] = payload
+ *
+ * buffer: 帧缓冲区 (需有至少 4 字节额外空间)
+ * len:    当前帧长度 (不含 FCS)
+ * pcp:    Priority Code Point (0-7)
+ * dei:    Drop Eligible Indicator (0-1)
+ * vid:    VLAN ID (1-4094)
+ * 返回:   插入后的帧长度 (-1=错误)
+ */
+int vlan_insert_tag(uint8_t *buffer, int len, uint8_t pcp, uint8_t dei, uint16_t vid) {
+    if (len < 14) return -1;  /* 帧头不完整 */
+
+    /* 检查是否已有 VLAN Tag */
+    uint16_t tpid_check = (buffer[12] << 8) | buffer[13];
+    if (tpid_check == VLAN_TPID) return -1;  /* 已标记 */
+
+    /* 保存原 EtherType (位于 buffer[12-13]) */
+    uint16_t orig_ethertype = (buffer[12] << 8) | buffer[13];
+
+    /* 将 payload 向后移动 4 字节 (从末尾开始) */
+    for (int i = len - 1; i >= 14; i--) {
+        buffer[i + 4] = buffer[i];
+    }
+
+    /* 插入 VLAN Tag */
+    buffer[12] = (VLAN_TPID >> 8) & 0xFF;     /* 0x81 */
+    buffer[13] = VLAN_TPID & 0xFF;             /* 0x00 */
+
+    uint16_t tci = vlan_make_tci(pcp, dei, vid);
+    buffer[14] = (tci >> 8) & 0xFF;
+    buffer[15] = tci & 0xFF;
+
+    /* 恢复原 EtherType (在 Tag 之后) */
+    buffer[16] = (orig_ethertype >> 8) & 0xFF;
+    buffer[17] = orig_ethertype & 0xFF;
+
+    return len + 4;
+}
+
+/**
+ * 移除 VLAN Tag
+ *
+ * buffer: 帧缓冲区
+ * len:    当前帧长度 (输入/输出参数)
+ * 返回:   1=成功移除, 0=不是 VLAN 帧, -1=帧太短
+ */
+int vlan_remove_tag(uint8_t *buffer, int *len) {
+    if (*len < 18) return -1;  /* 至少 14(帧头) + 4(Tag) */
+
+    /* 检查 TPID */
+    uint16_t tpid = (buffer[12] << 8) | buffer[13];
+    if (tpid != VLAN_TPID) return 0;  /* 不是 VLAN 帧 */
+
+    /* 读取插入的 EtherType (在 Tag 之后) */
+    uint16_t inner_ethertype = (buffer[16] << 8) | buffer[17];
+
+    /* 提取 TCI 信息 (可选: 记录 VID 等) */
+    uint16_t tci = (buffer[14] << 8) | buffer[15];
+    uint16_t vid = tci & 0x0FFF;
+    (void)vid;  /* 如需使用 VID 可取消注释 */
+
+    /* 将 payload 向前移动 4 字节 */
+    int payload_start = 18;  /* dst(6)+src(6)+TPID(2)+TCI(2)+EtherType(2) */
+    int payload_end = *len;  /* 原始帧结束 */
+    for (int i = payload_start; i < payload_end; i++) {
+        buffer[i - 4] = buffer[i];
+    }
+
+    /* 恢复 EtherType 到原始位置 */
+    buffer[12] = (inner_ethertype >> 8) & 0xFF;
+    buffer[13] = inner_ethertype & 0xFF;
+
+    *len -= 4;
+    return 1;
+}
+
+/* 示例：从 VLAN 帧中提取 VID */
+uint16_t vlan_get_vid(const uint8_t *buffer) {
+    uint16_t tpid = (buffer[12] << 8) | buffer[13];
+    if (tpid != VLAN_TPID) return 0;
+    uint16_t tci = (buffer[14] << 8) | buffer[15];
+    return tci & 0x0FFF;
+}
+
+/* 示例：从 VLAN 帧中提取 PCP */
+uint8_t vlan_get_pcp(const uint8_t *buffer) {
+    uint16_t tpid = (buffer[12] << 8) | buffer[13];
+    if (tpid != VLAN_TPID) return 0;
+    uint16_t tci = (buffer[14] << 8) | buffer[15];
+    return (tci >> 13) & 0x07;
+}
+```
+
+#### 动手练习
+
+1. 用 Wireshark 观察一个带 VLAN Tag 的帧，对比插入前后的 hex 变化
+2. 编写一个测试函数：创建一个普通的 ARP 帧，调用 `vlan_insert_tag()` 插入 VID=100 的 Tag，然后用 `vlan_remove_tag()` 移除
+3. 思考：如果一个交换机 Access 端口收到一个已标记 (tagged) 的帧，应该怎么处理？
+4. 挑战：实现 Q-in-Q (802.1ad) 的双层 Tag 插入
+
+#### VLAN Tag 对帧长度的影响
+
+| 项目 | 无 Tag | 有 Tag |
+|------|--------|--------|
+| 最小帧长度 | 64 字节 | 68 字节 |
+| 最大帧长度 | 1518 字节 | 1522 字节 |
+| MAC 头部 | 14 字节 | 18 字节 (含 4 字节 Tag) |
+| 最大 Payload | 1500 字节 | 1500 字节 (EtherType 后移) |
+
+注意：交换机的 Trunk 端口会在转发时保持 Tag 不变，而 Access 端口在发送到终端前移除 Tag。
+
+---
+
+### B.8 参考速查表 (Reference Tables)
+
+#### 常用 EtherType
+
+| 值 | 协议 | 说明 |
+|----|------|------|
+| `0x0800` | IPv4 | Internet Protocol version 4 |
+| `0x0806` | ARP | Address Resolution Protocol |
+| `0x8100` | 802.1Q | VLAN Tagged Frame |
+| `0x86DD` | IPv6 | Internet Protocol version 6 |
+| `0x8808` | MAC Control | 802.3x Pause Frame |
+| `0x88CC` | LLDP | Link Layer Discovery Protocol |
+| `0x888E` | EAPoL | 802.1X Authentication |
+| `0x88A8` | 802.1ad | Q-in-Q (Service VLAN) |
+| `0x88F7` | PTP | Precision Time Protocol (1588) |
+
+#### 常用 UDP/TCP 端口
+
+| 端口 | 协议 | 说明 |
+|------|------|------|
+| 7 | UDP/TCP | Echo (回显服务) |
+| 20/21 | TCP | FTP (数据/控制) |
+| 22 | TCP | SSH (安全 Shell) |
+| 23 | TCP | Telnet |
+| 25 | TCP | SMTP (邮件发送) |
+| 53 | UDP/TCP | DNS (域名解析) |
+| 67/68 | UDP | DHCP (地址分配) |
+| 80 | TCP | HTTP (网页) |
+| 123 | UDP | NTP (时间同步) |
+| 161/162 | UDP | SNMP (网络管理) |
+| 443 | TCP | HTTPS (加密网页) |
+| 502 | TCP | Modbus TCP (工业自动化) |
+| 1900 | UDP | SSDP (UPnP 设备发现) |
+| 5353 | UDP | mDNS (多播 DNS) |
+| 5683 | UDP | CoAP (物联网) |
+
+#### 特殊 MAC 地址
+
+| MAC 地址 | 名称 | 说明 |
+|----------|------|------|
+| `FF-FF-FF-FF-FF-FF` | 广播 MAC | 发送到所有设备 (IP 广播时使用) |
+| `01-80-C2-00-00-00` | STP 组播 | 802.1D 生成树 BPDU 的目的 MAC |
+| `01-80-C2-00-00-01` | MAC Control | 802.3x Pause 帧的目的 MAC |
+| `01-80-C2-00-00-02` | LACP | 链路聚合控制 (802.3ad) |
+| `01-80-C2-00-00-03` | 802.1X | EAPoL 认证帧 |
+| `01-80-C2-00-00-0E` | LLDP 组播 | LLDP 协议的目的 MAC |
+| `01-00-5E-xx-xx-xx` | IPv4 组播 | 以太网多播 (映射自 IP 组播 224.0.0.0/4) |
+| `33-33-xx-xx-xx-xx` | IPv6 组播 | IPv6 多层多播 MAC |
+
+#### MAC 地址类型快速判断
+
+```c
+/* 判断是否为广播 MAC */
+int is_broadcast_mac(const uint8_t mac[6]) {
+    uint8_t bcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    return memcmp(mac, bcast, 6) == 0;
+}
+
+/* 判断是否为单播 MAC (第 1 字节最低位 = 0) */
+int is_unicast_mac(const uint8_t mac[6]) {
+    return (mac[0] & 0x01) == 0;
+}
+
+/* 判断是否为组播 MAC (第 1 字节最低位 = 1) */
+int is_multicast_mac(const uint8_t mac[6]) {
+    return (mac[0] & 0x01) != 0;
+}
+```
+
+---
+
+### B.9 自测题 (Self-Test Questions)
+
+**Q1：为什么以太网帧最小长度为 64 字节？**
+
+A：这是为了支持 **CSMA/CD 碰撞检测** 机制。在 10Mbps 以太网中，最长传输距离约 2500 米，信号在电缆上的往返时间 (RTT) 约为 51.2us。在 51.2us 内 10Mbps 可以传输 512 位 = 64 字节。如果帧长度小于 64 字节，发送方可能在数据发送完毕后才检测到碰撞，导致无法识别碰撞。因此最小帧长度被设定为 64 字节（从目的 MAC 到 FCS 结束，不含 Preamble 和 SFD）。
+
+**Q2：如果我看到一个 60 字节的以太网帧，这是怎么回事？**
+
+A：如果上层协议数据不足 64 字节（如 ARP 请求仅 42 字节），MAC 层会自动添加 **Padding (填充字节)** 使帧达到最小长度。60 字节的帧实际上缺少 FCS（4 字节），有些抓包工具会剥离 FCS。完整的帧应该是 64 字节：14 字节头部 + 28 字节 ARP + 18 字节填充 + 4 字节 FCS。Wireshark 可能显示为 60 字节（剥离了 FCS）。
+
+**Q3：如何将收到的 ARP 应答与之前发出的 ARP 请求匹配？**
+
+A：ARP 应答不包含与请求匹配的显式标识符。匹配依据是 **发送方 IP (SPA)**：如果收到的 ARP 应答中，SPA 等于你之前发送的 ARP 请求中的 TPA (目标 IP)，则认为匹配。还有一种方法是通过 ARP 缓存机制：发送请求时记录目标 IP 和发出时间，收到应答后查找缓存表中 IP 相同的条目进行匹配。建议的代码逻辑：
+
+```c
+/* 收到 ARP 应答后 */
+if (arp->oper == ntohs(2)) {  /* ARP Reply */
+    uint32_t resp_ip = (arp->spa[0] << 24) | (arp->spa[1] << 16) |
+                       (arp->spa[2] << 8) | arp->spa[3];
+    if (resp_ip == my_pending_target_ip) {
+        /* 匹配成功！这就是我们等待的 ARP 应答 */
+        memcpy(peer_mac, arp->sha, 6);
+    }
+}
+```
+
+**Q4：为什么 TCP 建立连接需要三次握手 (3-Way Handshake)，而不是两次？**
+
+A：三次握手的主要目的是 **防止历史失效的 SYN 段建立意外连接**。考虑以下场景：
+
+1. 客户端发送 SYN (seq=100) 到服务器，但该 SYN 在网络中滞留
+2. 客户端超时重发 SYN (seq=200)，到达服务器，服务器回复 SYN+ACK (seq=300, ack=201)
+3. 客户端收到 SYN+ACK，回复 ACK (seq=201, ack=301)，正常建立连接，数据传输后关闭
+4. **此时**，旧 SYN (seq=100) 到达服务器！服务器认为这是新的连接请求，回复 SYN+ACK (seq=400, ack=101)
+5. 客户端收到这个 SYN+ACK，发现 ack=101 与自己期望的序号不匹配（或连接已关闭），回复 RST
+
+如果只有两次握手，在步骤 4 中服务器会直接建立连接并等待数据，浪费资源。三次握手使服务器停留在 SYN-RCVD 状态，直到收到客户端的 ACK 确认，在此期间如果收到不匹配的 ACK 或 RST，可以安全地释放连接。
+
+另外，三次握手还实现了 **ISN (初始序列号) 的交换和确认**，双方都能确认对方的接收和发送能力正常。
+
+**Q5：VLAN Tag 对帧结构有什么具体影响？**
+
+A：VLAN Tag 在帧中插入 4 个额外字节，带来以下影响：
+
+1. **帧长度增加 4 字节**：原始帧从 64-1518 字节变为 68-1522 字节
+2. **结构变化**：原始的 EtherType 位置被 Tag 占用，原 EtherType 向后移动 4 字节
+3. **校验范围不变**：FCS 的 CRC32 校验覆盖包括 Tag 在内的整个帧
+4. **MTU 不变**：L2 的 Payload 最大仍为 1500 字节（EtherType 和 Payload 整体后移）
+5. **兼容性问题**：不支持 802.1Q 的传统设备可能把 `0x8100` 当作 LLC 长度字段处理，无法正确解析后续数据
+
+对于 Trunk 端口：允许多个 VLAN 的 tagged 帧通过，最大帧为 1522 字节。
+对于 Access 端口：通常只发送 untagged 帧，最大帧仍为 1518 字节。
+对于支持 Jumbo Frame 的网络：最大帧可达 9000+ 字节（含 Tag）。
+
+#### 综合思考题
+
+**Q6**：从 PC ping MCU (ICMP Echo)，在 MCU 端收到的帧与发送的帧之间，有哪些字节发生了变化？请逐字节列出。
+
+提示：答案应该涵盖 MAC 地址交换、IP 地址交换、TTL 减 1、ICMP Type 从 8 变为 0、校验和重算。
+
+**Q7**：UDP 校验和是强制性的吗？如果 UDP 校验和设置为 0，接收方应该怎么处理？
+
+A：在 IPv4 中，UDP 校验和是**可选的**（校验和为 0 表示发送方未计算校验和）。但在 IPv6 中，UDP 校验和是**强制性的**。接收方收到校验和为 0 的 UDP 数据报时，在 IPv4 网络中可以信任该数据并传递给上层，但为了健壮性，生产代码中应当总是计算正确的 UDP 校验和。
+
+**Q8**：如果 ARP 缓存中没有目标 IP 的条目，但上层应用需要发送 UDP 数据，MCU 应该按照什么顺序处理？
+
+A：正确流程：
+1. 检查 ARP 缓存，未找到条目
+2. 构造 ARP 请求并发送（广播）
+3. 将 UDP 数据报暂存到等待队列
+4. 设置 ARP 等待超时（通常 1 秒）
+5. 收到 ARP 应答后，更新 ARP 缓存
+6. 构造完整的以太网帧（插入正确的目的 MAC），发送暂存的 UDP 数据报
+7. 如果超时未收到 ARP 应答，通知上层"目标不可达"并丢弃数据
+
+---
+
+*附录 B 结束 -- 接下来可以在实际的 MCU 开发板上运行这些实验，配合 Wireshark 抓包验证每个步骤的输出结果。*
