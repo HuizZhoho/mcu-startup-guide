@@ -5065,3 +5065,3199 @@ A：正确流程：
 ---
 
 *附录 B 结束 -- 接下来可以在实际的 MCU 开发板上运行这些实验，配合 Wireshark 抓包验证每个步骤的输出结果。*
+
+---
+
+## Appendix C: Network Protocol State Machine Deep Dive
+
+> 网络协议状态机深度解析 -- 涵盖 ARP 缓存状态机、自动协商 (Auto-Neg) 状态机、TCP 简化状态机、PHY 链路检测状态机，每节包含文本图、C 代码实现、定时器与回调机制。
+
+---
+
+协议状态机是嵌入式网络协议栈的核心骨架。在裸机或 RTOS 环境下，每个协议层都维护自己的状态机，由主循环或定时器驱动状态迁移。本节深入剖析四个关键状态机的设计模式与实现细节。
+
+---
+
+### C.1 ARP 缓存状态机 (ARP Cache State Machine)
+
+ARP 缓存状态机管理 IP 到 MAC 地址映射的整个生命周期，是网络协议栈中最基础也最常用的状态机。与简单哈希表不同，带状态机的 ARP 缓存能够处理"查询中"的异步等待场景。
+
+#### C.1.1 状态图
+
+```
+                             +-----------+
+                     +------->  IDLE     <---------+
+                     |       +----+------+         |
+                     |            |                |
+                     |    (需要发送数据报,         (STALE 超时,
+                     |     缓存中无该 IP 的 MAC)    条目过期)
+                     |            |
+                     |            v
+                     |       +----+---------+
+         (3 次重试   |       |  RESOLVING   | ------+
+          超时无应答) |       +----+---------+       |
+                     |            |                 |
+                     |            | (收到 ARP 应答,  |
+                     |            |  学习到 MAC)     |
+                     |            v                 |
+                     |       +----+---------+       |
+                     +-------+  RESOLVED    |       |
+                             +----+---------+       |
+                                  |                 |
+                                  | (STALE 超时,    |
+                                  |  标记为陈旧)    |
+                                  v                 |
+                             +----+---------+       |
+                             |   STALE      |       |
+                             +--------------+       |
+                                  |                 |
+                                  +-----------------+
+                                  (需要再次发送时,
+                                   从 STALE 回到 RESOLVING)
+```
+
+**状态定义**：
+
+| 状态 | 说明 | 行为 |
+|------|------|------|
+| `IDLE` | 空闲态，该 IP 无缓存条目 | 不动作 |
+| `RESOLVING` | 解析中，已发送 ARP 请求，等待应答 | 缓存 ARP 请求重试计时器，可发送最多 3 次 ARP 请求 |
+| `RESOLVED` | 已解析，MAC 已知，缓存有效 | 可正常转发数据 |
+| `STALE` | 陈旧态，MAC 仍保留但标记为可能过时 | 下次发送数据前需重新解析 |
+
+**状态转换条件**：
+
+| 当前状态 | 下一状态 | 触发条件 |
+|----------|---------|----------|
+| `IDLE` | `RESOLVING` | 上层需要发送 IP 数据报，缓存中无对应条目 |
+| `RESOLVING` | `RESOLVED` | 收到匹配的 ARP 应答，提取到对端 MAC |
+| `RESOLVING` | `IDLE` | 重试 3 次后仍未收到 ARP 应答，超时放弃 |
+| `RESOLVED` | `STALE` | 条目存活超时（如 300s），变为陈旧 |
+| `STALE` | `RESOLVING` | 需要发送数据时检测到条目为 STALE |
+| `STALE` | `IDLE` | 短超时（如 30s）未使用，完全清除 |
+
+#### C.1.2 C 代码实现
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include <stdbool.h>
+
+/* ============================================================ */
+/* ARP 缓存状态机 -- 完整实现                                  */
+/* ============================================================ */
+
+#define ETH_ALEN            6
+#define ARP_CACHE_SIZE      16
+#define ARP_MAX_RETRIES     3
+#define ARP_RESOLVE_TIMEOUT 1000   /* 每次重试间隔 ms */
+#define ARP_RESOLVED_TTL    300000 /* RESOLVED -> STALE, 300s */
+#define ARP_STALE_TTL       30000  /* STALE -> IDLE, 30s */
+
+/* ----- 状态定义 ----- */
+typedef enum {
+    ARP_STATE_IDLE,       /* 无条目 */
+    ARP_STATE_RESOLVING,  /* ARP 请求已发送，等待应答 */
+    ARP_STATE_RESOLVED,   /* MAC 已知，缓存有效 */
+    ARP_STATE_STALE,      /* 缓存陈旧，再次使用前需解析 */
+} arp_state_t;
+
+/* ----- 事件枚举 (状态机的输入) ----- */
+typedef enum {
+    ARP_EVENT_NEED_SEND,    /* 上层需要发送数据 */
+    ARP_EVENT_REPLY_RCVD,   /* 收到 ARP 应答 */
+    ARP_EVENT_TIMEOUT,      /* 计时器超时 */
+    ARP_EVENT_AGING_TICK,   /* 老化滴答 */
+} arp_event_t;
+
+/* ----- 状态上下文结构 ----- */
+typedef struct {
+    uint32_t    ip_addr;           /* IP 地址 (网络字节序) */
+    uint8_t     mac_addr[ETH_ALEN]; /* MAC 地址 (仅 RESOLVED 有效) */
+    arp_state_t state;             /* 当前状态 */
+    uint8_t     retry_count;       /* 重试计数 */
+    uint32_t    state_timer_ms;    /* 当前状态停留时间 (ms) */
+    uint32_t    entry_timer_ms;    /* 条目生存时间 (ms) */
+    uint8_t     pending_tx;        /* 是否有待发送的数据等待解析完成 */
+    bool        valid;             /* 条目是否有效 */
+} arp_cache_entry_t;
+
+/* ----- 完整 ARP 缓存表 ----- */
+typedef struct {
+    arp_cache_entry_t entries[ARP_CACHE_SIZE];
+    uint32_t          tick_ms;  /* 系统 ms 时钟 */
+} arp_cache_table_t;
+
+/* ----- 动作回调函数指针类型 ----- */
+typedef void (*arp_on_resolved_t)(uint32_t ip, const uint8_t mac[ETH_ALEN]);
+typedef void (*arp_on_timeout_t)(uint32_t ip);
+typedef void (*arp_send_request_t)(uint32_t target_ip);
+
+/* ----- 状态机全局回调 ----- */
+static arp_on_resolved_t  g_arp_on_resolved  = NULL;
+typedef void (*arp_on_resolved_t)(uint32_t ip, const uint8_t mac[ETH_ALEN]);
+
+/* ============================================================ */
+/* 状态机核心: 单条目的状态机处理                               */
+/* ============================================================ */
+
+/**
+ * ARP 条目状态机处理函数
+ *
+ * 对每个条目独立驱动状态机，接收事件后完成状态迁移，
+ * 并在状态进入/退出时执行对应的动作回调。
+ *
+ * entry:     条目指针
+ * event:     输入事件
+ * ext_data:  事件附加数据 (如 ARP 应答中的 MAC 地址)
+ * send_req:  发送 ARP 请求的函数回调
+ * on_resolved: 解析完成回调
+ * on_timeout:  超时放弃回调
+ */
+static void arp_entry_state_machine(
+    arp_cache_entry_t *entry,
+    arp_event_t event,
+    const void *ext_data,
+    arp_send_request_t send_req,
+    arp_on_resolved_t on_resolved,
+    arp_on_timeout_t on_timeout)
+{
+    arp_state_t old_state = entry->state;
+
+    switch (entry->state) {
+
+    /* ---------- IDLE 状态 ---------- */
+    case ARP_STATE_IDLE:
+        switch (event) {
+        case ARP_EVENT_NEED_SEND:
+            /* 状态进入: 重置重试计数，清空 MAC，进入 RESOLVING */
+            entry->retry_count    = 0;
+            entry->pending_tx     = 1;
+            entry->state_timer_ms = 0;
+            memset(entry->mac_addr, 0, ETH_ALEN);
+            entry->state = ARP_STATE_RESOLVING;
+            /* 动作: 发送第一个 ARP 请求 */
+            if (send_req) send_req(entry->ip_addr);
+            break;
+        default:
+            break;
+        }
+        break;
+
+    /* ---------- RESOLVING 状态 ---------- */
+    case ARP_STATE_RESOLVING:
+        switch (event) {
+        case ARP_EVENT_REPLY_RCVD:
+            /* 状态进入: 保存 MAC，标记待发送数据可发送 */
+            if (ext_data) {
+                memcpy(entry->mac_addr, (const uint8_t *)ext_data, ETH_ALEN);
+            }
+            entry->pending_tx     = 0;
+            entry->entry_timer_ms = 0;
+            entry->state = ARP_STATE_RESOLVED;
+            /* 退出动作: 通知上层解析完成 */
+            if (on_resolved) on_resolved(entry->ip_addr, entry->mac_addr);
+            break;
+
+        case ARP_EVENT_TIMEOUT:
+            entry->retry_count++;
+            if (entry->retry_count < ARP_MAX_RETRIES) {
+                /* 重试: 重新发送 ARP 请求 */
+                entry->state_timer_ms = 0;
+                if (send_req) send_req(entry->ip_addr);
+            } else {
+                /* 超过最大重试次数, 放弃 */
+                entry->pending_tx  = 0;
+                entry->valid       = 0;
+                entry->state       = ARP_STATE_IDLE;
+                entry->state_timer_ms = 0;
+                /* 退出动作: 通知上层目标不可达 */
+                if (on_timeout) on_timeout(entry->ip_addr);
+            }
+            break;
+        default:
+            break;
+        }
+        break;
+
+    /* ---------- RESOLVED 状态 ---------- */
+    case ARP_STATE_RESOLVED:
+        switch (event) {
+        case ARP_EVENT_AGING_TICK:
+            /* 累积生存时间, 超时后进入 STALE */
+            if (entry->entry_timer_ms >= ARP_RESOLVED_TTL) {
+                entry->state = ARP_STATE_STALE;
+                entry->state_timer_ms = 0;
+            }
+            break;
+
+        case ARP_EVENT_REPLY_RCVD:
+            /* 收到重复/更新的 ARP 应答, 刷新 MAC 和计时器 */
+            if (ext_data) {
+                memcpy(entry->mac_addr, (const uint8_t *)ext_data, ETH_ALEN);
+            }
+            entry->entry_timer_ms = 0;  /* 刷新老化计时器 */
+            break;
+        default:
+            break;
+        }
+        break;
+
+    /* ---------- STALE 状态 ---------- */
+    case ARP_STATE_STALE:
+        switch (event) {
+        case ARP_EVENT_NEED_SEND:
+            /* 需要发送数据, 从 STALE 回退到 RESOLVING */
+            entry->retry_count    = 0;
+            entry->pending_tx     = 1;
+            entry->state_timer_ms = 0;
+            entry->state = ARP_STATE_RESOLVING;
+            if (send_req) send_req(entry->ip_addr);
+            break;
+
+        case ARP_EVENT_AGING_TICK:
+            /* STALE 短暂存活后完全清除 */
+            if (entry->entry_timer_ms >= ARP_STALE_TTL) {
+                entry->valid = 0;
+                entry->state = ARP_STATE_IDLE;
+                entry->state_timer_ms = 0;
+            }
+            break;
+
+        case ARP_EVENT_REPLY_RCVD:
+            /* 收到 ARP 应答 (对端也在通信), 回到 RESOLVED */
+            if (ext_data) {
+                memcpy(entry->mac_addr, (const uint8_t *)ext_data, ETH_ALEN);
+            }
+            entry->entry_timer_ms = 0;
+            entry->state = ARP_STATE_RESOLVED;
+            break;
+        default:
+            break;
+        }
+        break;
+    }
+}
+
+/* ============================================================ */
+/* 定时器: 每个条目独立计时                                    */
+/* ============================================================ */
+
+/**
+ * ARP 条目标记器更新 -- 每个条目独立计时
+ * 在主循环中周期性调用, 更新各条目计时器并驱动超时事件
+ *
+ * tbl:     ARP 缓存表
+ * elapsed_ms: 自上次调用以来的毫秒数
+ * send_req:   发送 ARP 请求的回调
+ * on_resolved: 解析完成回调
+ * on_timeout:  超时放弃回调
+ */
+void arp_cache_timer_tick(arp_cache_table_t *tbl, uint32_t elapsed_ms,
+                          arp_send_request_t send_req,
+                          arp_on_resolved_t on_resolved,
+                          arp_on_timeout_t   on_timeout)
+{
+    tbl->tick_ms += elapsed_ms;
+
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (!tbl->entries[i].valid) continue;
+
+        arp_cache_entry_t *entry = &tbl->entries[i];
+
+        /* 累计状态计时器 (用于 RESOLVING 超时检测) */
+        entry->state_timer_ms += elapsed_ms;
+
+        /* 累计条目生存计时器 (用于 RESOLVED/STALE 老化) */
+        entry->entry_timer_ms += elapsed_ms;
+
+        /* 触发超时事件 */
+        if (entry->state == ARP_STATE_RESOLVING) {
+            /* RESOLVING 超时: 检查是否需要触发重试 */
+            if (entry->state_timer_ms >= ARP_RESOLVE_TIMEOUT) {
+                arp_entry_state_machine(entry, ARP_EVENT_TIMEOUT, NULL,
+                                        send_req, on_resolved, on_timeout);
+            }
+        } else if (entry->state == ARP_STATE_RESOLVED) {
+            /* RESOLVED 老化 */
+            arp_entry_state_machine(entry, ARP_EVENT_AGING_TICK, NULL,
+                                    send_req, on_resolved, on_timeout);
+        } else if (entry->state == ARP_STATE_STALE) {
+            /* STALE 老化 */
+            arp_entry_state_machine(entry, ARP_EVENT_AGING_TICK, NULL,
+                                    send_req, on_resolved, on_timeout);
+        }
+    }
+}
+
+/* ============================================================ */
+/* 对外 API: 上层协议栈调用接口                                */
+/* ============================================================ */
+
+/**
+ * 查找或创建条目, 触发 ARP 解析
+ * 由 IP 层在发送数据报前调用
+ *
+ * 返回: true = MAC 已知, 可直接发送;
+ *       false = 解析中, 需等待回调后发送
+ */
+bool arp_cache_resolve(arp_cache_table_t *tbl, uint32_t target_ip,
+                       uint8_t out_mac[ETH_ALEN],
+                       arp_send_request_t send_req,
+                       arp_on_resolved_t on_resolved,
+                       arp_on_timeout_t   on_timeout)
+{
+    /* 查找是否已有条目 */
+    arp_cache_entry_t *entry = NULL;
+    int empty_slot = -1;
+
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (!tbl->entries[i].valid) {
+            if (empty_slot < 0) empty_slot = i;
+            continue;
+        }
+        if (tbl->entries[i].ip_addr == target_ip) {
+            entry = &tbl->entries[i];
+            break;
+        }
+    }
+
+    /* 未找到, 创建新条目 */
+    if (entry == NULL) {
+        if (empty_slot < 0) return false; /* 缓存满 */
+        entry = &tbl->entries[empty_slot];
+        entry->ip_addr  = target_ip;
+        entry->valid    = true;
+        entry->state    = ARP_STATE_IDLE;
+        entry->state_timer_ms = 0;
+        entry->entry_timer_ms = 0;
+        entry->retry_count    = 0;
+        entry->pending_tx     = 0;
+        memset(entry->mac_addr, 0, ETH_ALEN);
+    }
+
+    /* 如果已 RESOLVED, 直接返回 MAC */
+    if (entry->state == ARP_STATE_RESOLVED) {
+        memcpy(out_mac, entry->mac_addr, ETH_ALEN);
+        return true;
+    }
+
+    /* 否则投递 NEED_SEND 事件, 触发状态机 */
+    arp_entry_state_machine(entry, ARP_EVENT_NEED_SEND, NULL,
+                            send_req, on_resolved, on_timeout);
+    return false; /* 返回 false, 上层需等待回调 */
+}
+
+/**
+ * 处理收到的 ARP 应答 -- 由网络接收路径调用
+ */
+void arp_cache_handle_reply(arp_cache_table_t *tbl,
+                            uint32_t sender_ip,
+                            const uint8_t sender_mac[ETH_ALEN],
+                            arp_send_request_t send_req,
+                            arp_on_resolved_t on_resolved,
+                            arp_on_timeout_t   on_timeout)
+{
+    /* 查找匹配条目 */
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (!tbl->entries[i].valid) continue;
+        if (tbl->entries[i].ip_addr == sender_ip) {
+            arp_entry_state_machine(&tbl->entries[i],
+                                    ARP_EVENT_REPLY_RCVD,
+                                    sender_mac,
+                                    send_req, on_resolved, on_timeout);
+            return;
+        }
+    }
+
+    /* 未找到条目但收到应答: 学习新条目 (Gratuitous ARP 学习) */
+    int empty_slot = -1;
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (!tbl->entries[i].valid) { empty_slot = i; break; }
+    }
+    if (empty_slot >= 0) {
+        arp_cache_entry_t *entry = &tbl->entries[empty_slot];
+        entry->valid    = true;
+        entry->ip_addr  = sender_ip;
+        memcpy(entry->mac_addr, sender_mac, ETH_ALEN);
+        entry->state    = ARP_STATE_RESOLVED;
+        entry->state_timer_ms = 0;
+        entry->entry_timer_ms = 0;
+        entry->retry_count    = 0;
+        entry->pending_tx     = 0;
+    }
+}
+
+/**
+ * 初始化 ARP 缓存表
+ */
+void arp_cache_init(arp_cache_table_t *tbl) {
+    memset(tbl, 0, sizeof(arp_cache_table_t));
+}
+```
+
+#### C.1.3 状态机设计要点
+
+**何时引入 STALE 状态**：很多简单实现只有 RESOLVED -> IDLE 直接超时清除。引入 STALE 的好处是：如果对端只是短暂离线后恢复，ARP 请求不会立即广播（避免不必要的网络流量），但如果长期未使用则完全清除条目。
+
+**pending_tx 标记**：当状态机处于 RESOLVING 时，上层可能需要发送的数据必须暂存。这个标记位通知协议栈"数据已暂存，等待 MAC 就绪后发送"。
+
+**Gratuitous ARP 学习**：收到非请求的 ARP 应答（Gratuitous ARP）时，即使之前的缓存条目处于 IDLE 或不存在，也可以直接学习到 MAC 地址并进入 RESOLVED 状态，这是 ARP 协议中"免请求学习"机制的体现。
+
+---
+
+### C.2 Auto-Negotiation 状态机 (Auto-Neg State Machine)
+
+自动协商状态机位于 PHY 内部，但 MCU 端需要监控和管理这个状态机。与 PHY 驱动状态机（第九章）不同，这里聚焦于自动协商协议本身的内部状态流转。
+
+#### C.2.1 状态图
+
+```
+                      +----------------+
+                      |   DISABLED     |
+                      +-------+--------+
+                              |
+                     (使能 Auto-Neg,
+                      写入 BMCR.12=1)
+                              |
+                              v
+                      +-------+--------+
+               +----->   ENABLED       |
+               |     +-------+--------+
+               |             |
+               |     (触发重新协商,
+               |      BMCR.9=1)
+               |             |
+               |             v
+               |     +-------+--------+
+               |     |  START_ANEG    | <-- 发送 FLP Burst
+               |     +-------+--------+
+               |             |
+               |      (3 次一致 FLP
+               |       Burst 接收完成)
+               |             |
+               |             v
+               |     +-------+--------+
+               |     | ANEG_WAIT      | <-- 等待 ANEG Complete
+               |     | (BMSR.5 检测)   |     (BMSR.5=1)
+               |     +-------+--------+
+               |             |
+               |      (协商完成)
+               |             |
+               |             v
+               |     +-------+--------+
+               |     | ANEG_COMPLETE  | <-- 读取 ANLPAR, 裁决 HCD
+               |     +-------+--------+
+               |             |
+               |     (链路建立,
+               |      BMSR.2=1)
+               |             |
+               |             v
+               |     +-------+--------+
+               |     |   LINK_UP      | <-- 正常运行
+               |     +-------+--------+
+               |             |
+               |      (链路断开,
+               |       BMSR.2=0)
+               |             |
+               |             v
+               |     +-------+--------+
+               |     |  LINK_DOWN     | <-- 链路断开处理
+               |     +-------+--------+
+               |             |
+               |      (尝试恢复,
+               |       重试 <= N)
+               |             |
+               +-------------+
+               (重试 > N, 进入错误处理)
+```
+
+#### C.2.2 C 代码实现 (MCU 侧监控 PHY)
+
+```c
+#include <stdint.h>
+#include <stdbool.h>
+
+/* ============================================================ */
+/* Auto-Neg 状态机 -- MCU 侧监控 PHY                            */
+/* ============================================================ */
+
+/* PHY 寄存器地址 */
+#define PHY_REG_BMCR   0x00
+#define PHY_REG_BMSR   0x01
+#define PHY_REG_ANAR   0x04
+#define PHY_REG_ANLPAR 0x05
+
+/* BMCR 位 */
+#define BMCR_RESET         0x8000
+#define BMCR_AN_EN         0x1000
+#define BMCR_RESTART_ANEG  0x0200
+
+/* BMSR 位 */
+#define BMSR_AN_COMP      0x0020
+#define BMSR_LINK_STATUS  0x0004
+
+/* ----- 状态定义 ----- */
+typedef enum {
+    ANEG_DISABLED,
+    ANEG_ENABLED,
+    ANEG_START,
+    ANEG_WAIT,          /* 等待 ANEG 完成 (BMSR.5) */
+    ANEG_COMPLETE,      /* 协商完成,读取结果 */
+    ANEG_LINK_UP,       /* 链路已建立 */
+    ANEG_LINK_DOWN,     /* 链路断开 */
+    ANEG_ERROR,         /* 错误状态 */
+} aneg_state_t;
+
+/* ----- 协商结果 ----- */
+typedef struct {
+    uint8_t  speed;       /* 10, 100, 1000 */
+    uint8_t  duplex;      /* 0=half, 1=full */
+    bool     pause_sym;   /* 对称流控 */
+    bool     pause_asym;  /* 非对称流控 */
+} aneg_result_t;
+
+/* ----- 状态机上下文 ----- */
+typedef struct {
+    aneg_state_t state;           /* 当前状态 */
+    uint8_t      phy_addr;        /* PHY 地址 */
+    uint8_t      retry_count;     /* 重试次数 */
+    uint32_t     timer_ms;        /* 状态计时器 */
+    uint32_t     wait_timeout_ms; /* 等待超时配置 */
+    aneg_result_t result;         /* 协商结果 */
+
+    /* PHY 寄存器读写回调 (由硬件抽象层提供) */
+    uint16_t (*read_reg)(uint8_t phy_addr, uint8_t reg);
+    void     (*write_reg)(uint8_t phy_addr, uint8_t reg, uint16_t val);
+
+    /* 动作回调 */
+    void (*on_link_up)(const aneg_result_t *result);
+    void (*on_link_down)(void);
+} aneg_context_t;
+
+/* ----- 能力优先级裁决 ----- */
+#define AN_10BT_HD  0x0020
+#define AN_10BT_FD  0x0040
+#define AN_100TX_HD 0x0080
+#define AN_100TX_FD 0x0100
+#define AN_PAUSE    0x0400
+#define AN_ASM_DIR  0x0800
+
+static aneg_result_t aneg_resolve_hcd(uint16_t local, uint16_t partner) {
+    aneg_result_t res = {0, 0, false, false};
+    uint16_t common = local & partner;
+
+    if (common & AN_100TX_FD) { res.speed = 100; res.duplex = 1; }
+    else if (common & AN_100TX_HD) { res.speed = 100; res.duplex = 0; }
+    else if (common & AN_10BT_FD)  { res.speed = 10;  res.duplex = 1; }
+    else if (common & AN_10BT_HD)  { res.speed = 10;  res.duplex = 0; }
+
+    /* Pause 流控裁决 (802.3 Table 28B-2) */
+    uint8_t loc_pause = ((local  >> 10) & 0x03);
+    uint8_t rmt_pause = ((partner >> 10) & 0x03);
+    if ((loc_pause & 0x01) && (rmt_pause & 0x01)) res.pause_sym = true;
+    else if ((loc_pause & 0x02) && (rmt_pause & 0x01)) res.pause_asym = true;
+
+    return res;
+}
+
+/* ============================================================ */
+/* 状态机主循环                                                 */
+/* ============================================================ */
+
+/**
+ * Auto-Neg 状态机主函数 -- 每次读取 PHY 寄存器后驱动一次状态迁移
+ * 建议在主循环中每 10-50ms 调用一次
+ *
+ * 返回: 当前状态, 用于调试打印
+ */
+aneg_state_t aneg_state_machine_run(aneg_context_t *ctx) {
+    uint16_t bmcr, bmsr, anlpar;
+    aneg_result_t new_result;
+
+    switch (ctx->state) {
+
+    /* ======== DISABLED: 使能 Auto-Neg ======== */
+    case ANEG_DISABLED:
+        /* 状态入口动作: 写入 BMCR 使能 Auto-Neg */
+        ctx->write_reg(ctx->phy_addr, PHY_REG_BMCR, BMCR_AN_EN);
+        ctx->timer_ms = 0;
+        ctx->retry_count = 0;
+        ctx->state = ANEG_ENABLED;
+        break;
+
+    /* ======== ENABLED: 触发重新协商 ======== */
+    case ANEG_ENABLED:
+        /* 状态入口动作: 设置 ANAR + 触发重新协商 */
+        bmcr = ctx->read_reg(ctx->phy_addr, PHY_REG_BMCR);
+        bmcr |= BMCR_AN_EN | BMCR_RESTART_ANEG;
+        ctx->write_reg(ctx->phy_addr, PHY_REG_BMCR, bmcr);
+        ctx->timer_ms = 0;
+        ctx->state = ANEG_START;
+        break;
+
+    /* ======== START: 发起 FLP Burst ======== */
+    case ANEG_START:
+        ctx->timer_ms += 50; /* 假设每次调用间隔 50ms */
+
+        /* 读取 BMSR 检查 ANEG 是否完成 */
+        bmsr = ctx->read_reg(ctx->phy_addr, PHY_REG_BMSR);
+
+        /* 第二次读取: 清除锁存 + 获取真实状态 */
+        bmsr = ctx->read_reg(ctx->phy_addr, PHY_REG_BMSR);
+
+        if (bmsr & BMSR_AN_COMP) {
+            /* 自动协商完成, 进入 COMPLETE 读取结果 */
+            ctx->state = ANEG_COMPLETE;
+        }
+
+        /* 超时检测: ANEG 应在 3 秒内完成 */
+        if (ctx->timer_ms >= ctx->wait_timeout_ms) {
+            ctx->retry_count++;
+            if (ctx->retry_count < 3) {
+                ctx->state = ANEG_ENABLED;  /* 重试 */
+            } else {
+                /* 并行检测: 尝试根据 LINK STATUS 强制模式 */
+                if (bmsr & BMSR_LINK_STATUS) {
+                    /* 有链路但 ANEG 未完成, 可能是并行检测 */
+                    ctx->result.speed  = 100;  /* 假设 100M */
+                    ctx->result.duplex = 0;    /* 假设半双工 */
+                    ctx->state = ANEG_LINK_UP;
+                    if (ctx->on_link_up) ctx->on_link_up(&ctx->result);
+                } else {
+                    ctx->state = ANEG_ERROR;
+                }
+            }
+            ctx->timer_ms = 0;
+        }
+        break;
+
+    /* ======== WAIT: 等 ANEG Complete (备选路径) ======== */
+    case ANEG_WAIT:
+        ctx->timer_ms += 50;
+        bmsr = ctx->read_reg(ctx->phy_addr, PHY_REG_BMSR);
+        bmsr = ctx->read_reg(ctx->phy_addr, PHY_REG_BMSR); /* 清除锁存 */
+
+        if (bmsr & BMSR_AN_COMP) {
+            ctx->state = ANEG_COMPLETE;
+        }
+        if (ctx->timer_ms >= ctx->wait_timeout_ms) {
+            ctx->state = ANEG_LINK_DOWN;
+        }
+        break;
+
+    /* ======== COMPLETE: 读取协商结果 ======== */
+    case ANEG_COMPLETE:
+        /* 读取本端和对端能力寄存器 */
+        anlpar = ctx->read_reg(ctx->phy_addr, PHY_REG_ANLPAR);
+        uint16_t anar = ctx->read_reg(ctx->phy_addr, PHY_REG_ANAR);
+
+        /* 裁决最高公共能力 */
+        new_result = aneg_resolve_hcd(anar, anlpar);
+        ctx->result = new_result;
+
+        /* 检查链路是否真正建立 */
+        bmsr = ctx->read_reg(ctx->phy_addr, PHY_REG_BMSR);
+        bmsr = ctx->read_reg(ctx->phy_addr, PHY_REG_BMSR);
+        if (bmsr & BMSR_LINK_STATUS) {
+            ctx->state = ANEG_LINK_UP;
+            /* 通知上层: 链路已建立, 速率为 xxx */
+            if (ctx->on_link_up) ctx->on_link_up(&ctx->result);
+        } else {
+            ctx->state = ANEG_LINK_DOWN;
+        }
+        break;
+
+    /* ======== LINK_UP: 正常运行态, 监控链路状态 ======== */
+    case ANEG_LINK_UP:
+        bmsr = ctx->read_reg(ctx->phy_addr, PHY_REG_BMSR);
+        bmsr = ctx->read_reg(ctx->phy_addr, PHY_REG_BMSR);
+        if (!(bmsr & BMSR_LINK_STATUS)) {
+            ctx->state = ANEG_LINK_DOWN;
+            if (ctx->on_link_down) ctx->on_link_down();
+        }
+        break;
+
+    /* ======== LINK_DOWN: 链路断开处理 ======== */
+    case ANEG_LINK_DOWN:
+        ctx->retry_count++;
+        if (ctx->retry_count <= 5) {
+            /* 重新尝试自动协商 */
+            ctx->state = ANEG_ENABLED;
+        } else {
+            ctx->state = ANEG_ERROR;
+        }
+        break;
+
+    /* ======== ERROR: 错误处理 ======== */
+    case ANEG_ERROR:
+        /* 错误状态, 10 秒后自动重试 */
+        ctx->timer_ms += 50;
+        if (ctx->timer_ms >= 10000) {
+            ctx->timer_ms = 0;
+            ctx->retry_count = 0;
+            ctx->state = ANEG_DISABLED;
+        }
+        break;
+    }
+
+    return ctx->state;
+}
+
+/**
+ * 初始化 Auto-Neg 状态机上下文
+ */
+void aneg_context_init(aneg_context_t *ctx, uint8_t phy_addr,
+                       uint16_t (*read_reg)(uint8_t, uint8_t),
+                       void (*write_reg)(uint8_t, uint8_t, uint16_t),
+                       void (*on_link_up)(const aneg_result_t *),
+                       void (*on_link_down)(void))
+{
+    ctx->state           = ANEG_DISABLED;
+    ctx->phy_addr        = phy_addr;
+    ctx->retry_count     = 0;
+    ctx->timer_ms        = 0;
+    ctx->wait_timeout_ms = 3000;  /* 默认 3 秒超时 */
+    ctx->read_reg        = read_reg;
+    ctx->write_reg       = write_reg;
+    ctx->on_link_up      = on_link_up;
+    ctx->on_link_down    = on_link_down;
+}
+```
+
+#### C.2.3 与第九章 PHY 驱动状态机的关系
+
+第九章的 PHY 驱动状态机（`phy_state_machine_tick`）是上层管理状态机，涵盖了从电源复位到链路建立的完整 PHY 生命周期（11 个状态）。本节的 Auto-Neg 状态机则聚焦于自动协商子过程本身（7 个状态）。
+
+两者的关系：
+- PHY 驱动状态机作为总控制器，在 `PHY_STATE_WAIT_ANEG` 子状态中调用本节的 ANEG 状态机
+- ANEG 状态机专注于 FLP Burst 交换、ACK 确认、HCD 裁决等 ANEG 特有逻辑
+- ANEG 完成后的结果（speed/duplex/pause）向上传递给 PHY 驱动状态机，最终通知 MAC 层
+
+---
+
+### C.3 TCP 连接状态机 (简化版, 面向 MCU 服务器)
+
+完整的 TCP 状态机有 11 个状态（RFC 793）。在 MCU 服务器场景中，通常只涉及 CLOSED、LISTEN、SYN_RCVD、ESTABLISHED、FIN_WAIT_1、FIN_WAIT_2、CLOSE_WAIT、LAST_ACK、TIME_WAIT 中的子集。本节提供面向嵌入式服务器的简化 6 状态实现。
+
+#### C.3.1 状态图 (MCU 服务器视角)
+
+```
+                           +--------------------+
+                           |      CLOSED        |
+                           +--------+-----------+
+                                    |
+                            (调用 tcp_bind + tcp_listen)
+                                    |
+                                    v
+                           +--------+-----------+
+                    +------>      LISTEN         |
+                    |      +--------+-----------+
+                    |               |
+                    |       (收到 SYN 报文,
+                    |        发送 SYN+ACK)
+                    |               |
+                    |               v
+                    |      +--------+-----------+
+                    |      |     SYN_RCVD        |
+                    |      +--------+-----------+
+                    |               |
+                    |       (收到 ACK, 三次握手完成)
+                    |               |
+                    |               v
+                    |      +--------+-----------+
+                    |      |   ESTABLISHED      | <-- 正常运行,收发数据
+                    |      +--------+-----------+
+                    |               |
+                    |       (收到 FIN,           (主动发送 FIN,
+                    |        发送 ACK)           收到 ACK)
+                    |               |               |
+                    |               v               v
+                    |      +--------+--------+   +--+-----------+
+                    |      |   CLOSE_WAIT    |   | FIN_WAIT_1   |
+                    |      +--------+--------+   +--+-----------+
+                    |               |               |
+                    |       (发送 FIN)        (收到 ACK)
+                    |               |               |
+                    |               v               v
+                    |      +--------+--------+   +--+-----------+
+                    |      |    LAST_ACK     |   | FIN_WAIT_2   |
+                    |      +--------+--------+   +--+-----------+
+                    |               |               |
+                    |       (收到 ACK,         (收到 FIN,
+                    |        连接关闭)          发送 ACK)
+                    |               |               |
+                    |               +-------+-------+
+                    |                       |
+                    |                       v
+                    |               +-------+--------+
+                    |               |   TIME_WAIT    | (2MSL 等待)
+                    |               +-------+--------+
+                    |                       |
+                    +-----------------------+
+                                    |
+                            (超时或异常)
+                                    v
+                           +--------+-----------+
+                           |      CLOSED        |
+                           +--------------------+
+```
+
+#### C.3.2 C 代码实现 (简化 TCP 状态处理器)
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include <stdbool.h>
+
+/* ============================================================ */
+/* 简化 TCP 连接状态机 -- 嵌入式服务器端                        */
+/* ============================================================ */
+
+/* TCP 标志位 */
+#define TCP_FLAG_FIN  0x01
+#define TCP_FLAG_SYN  0x02
+#define TCP_FLAG_RST  0x04
+#define TCP_FLAG_PSH  0x08
+#define TCP_FLAG_ACK  0x10
+
+/* ----- TCP 状态 (服务器相关子集) ----- */
+typedef enum {
+    TCP_CLOSED,
+    TCP_LISTEN,
+    TCP_SYN_RCVD,
+    TCP_ESTABLISHED,
+    TCP_CLOSE_WAIT,
+    TCP_LAST_ACK,
+    TCP_FIN_WAIT_1,
+    TCP_FIN_WAIT_2,
+    TCP_TIME_WAIT,
+} tcp_state_t;
+
+/* ----- TCP 事件 (来自报文解析 + 上层调用) ----- */
+typedef enum {
+    TCP_EVENT_RCV_SYN,       /* 收到 SYN */
+    TCP_EVENT_RCV_SYNACK,    /* 收到 SYN+ACK (客户端模式) */
+    TCP_EVENT_RCV_ACK,       /* 收到 ACK */
+    TCP_EVENT_RCV_FIN,       /* 收到 FIN */
+    TCP_EVENT_RCV_RST,       /* 收到 RST */
+    TCP_EVENT_APP_SEND,      /* 上层请求发送数据 */
+    TCP_EVENT_APP_CLOSE,     /* 上层请求关闭 */
+    TCP_EVENT_TIMEOUT,       /* 计时器超时 */
+} tcp_event_t;
+
+/* ----- TCP 连接控制块 (简化) ----- */
+typedef struct tcp_sock {
+    tcp_state_t state;           /* 当前状态 */
+
+    /* 序列号空间 */
+    uint32_t snd_nxt;            /* 下一个待发送的序列号 */
+    uint32_t rcv_nxt;            /* 下一个期望接收的序列号 */
+    uint16_t local_port;         /* 本地端口 */
+    uint16_t remote_port;        /* 远端端口 */
+    uint8_t  local_mac[6];       /* 本机 MAC */
+    uint8_t  remote_mac[6];      /* 远端 MAC */
+    uint32_t local_ip;           /* 本机 IP (网络字节序) */
+    uint32_t remote_ip;          /* 远端 IP (网络字节序) */
+
+    /* 计时器 */
+    uint32_t timewait_timer_ms;  /* TIME_WAIT 计时器 */
+
+    /* 发送/接收缓冲区 (简化) */
+    uint8_t  *rcv_buf;
+    uint16_t  rcv_len;
+    uint16_t  rcv_capacity;
+    uint8_t  *snd_buf;
+    uint16_t  snd_len;
+    uint16_t  snd_capacity;
+
+    /* 回调函数 */
+    void (*on_connected)(struct tcp_sock *sock);
+    void (*on_data)(struct tcp_sock *sock, const uint8_t *data, uint16_t len);
+    void (*on_closed)(struct tcp_sock *sock);
+    void (*on_error)(struct tcp_sock *sock);
+
+    /* 报文发送回调 (由底层 MAC 层提供) */
+    void (*send_frame)(const uint8_t *frame, uint16_t len);
+} tcp_sock_t;
+
+/* ============================================================ */
+/* TCP 状态机核心处理函数                                       */
+/* ============================================================ */
+
+/**
+ * TCP 状态机 -- 处理单个事件
+ *
+ * sock:    TCP 连接控制块
+ * event:   输入事件
+ * flags:   收到的 TCP 标志位 (仅报文事件有效)
+ * ext_data: 事件附加数据 (如收到报文的序列号)
+ *
+ * 返回: true 表示事件被处理, false 表示事件在当前状态下非法
+ */
+bool tcp_state_machine_handle(tcp_sock_t *sock, tcp_event_t event,
+                              uint8_t flags, uint32_t ext_seq)
+{
+    /* 记录旧状态用于调试和退出动作 */
+    tcp_state_t old_state = sock->state;
+
+    switch (sock->state) {
+
+    /* ======== CLOSED ======== */
+    case TCP_CLOSED:
+        switch (event) {
+        case TCP_EVENT_RCV_SYN:
+            /* 收到 SYN: 建立被动连接 */
+            sock->rcv_nxt = ext_seq + 1;   /* 期望下一个是 seq+1 */
+            sock->snd_nxt = 1000;           /* 本端 ISN (实际应随机) */
+            sock->state = TCP_SYN_RCVD;
+            /* 动作: 发送 SYN+ACK */
+            /* tcp_send_segment(sock, TCP_FLAG_SYN | TCP_FLAG_ACK); */
+            return true;
+
+        case TCP_EVENT_APP_CLOSE:
+            /* 已经在 CLOSED, 无需动作 */
+            return true;
+
+        default:
+            return false;  /* 非法事件 */
+        }
+        break;
+
+    /* ======== LISTEN ======== */
+    case TCP_LISTEN:
+        switch (event) {
+        case TCP_EVENT_RCV_SYN:
+            /* 收到 SYN: 进入 SYN_RCVD, 回复 SYN+ACK */
+            sock->rcv_nxt = ext_seq + 1;
+            sock->snd_nxt = 1000;  /* ISN */
+            sock->state = TCP_SYN_RCVD;
+            /* 动作: 发送 SYN+ACK (seq=snd_nxt, ack=rcv_nxt) */
+            /* tcp_send_segment(sock, TCP_FLAG_SYN | TCP_FLAG_ACK); */
+            return true;
+
+        case TCP_EVENT_RCV_RST:
+            /* 收到 RST: 忽略, 保持监听 */
+            return true;
+
+        default:
+            return false;
+        }
+        break;
+
+    /* ======== SYN_RCVD ======== */
+    case TCP_SYN_RCVD:
+        switch (event) {
+        case TCP_EVENT_RCV_ACK:
+            /* 收到 ACK: 三次握手完成, 进入 ESTABLISHED */
+            sock->snd_nxt = ext_seq;  /* 更新本端序列号 */
+            sock->state = TCP_ESTABLISHED;
+            /* 入口动作: 调用 on_connected 回调 */
+            if (sock->on_connected) sock->on_connected(sock);
+            return true;
+
+        case TCP_EVENT_RCV_RST:
+            /* 收到 RST: 回到 LISTEN */
+            sock->state = TCP_LISTEN;
+            return true;
+
+        case TCP_EVENT_TIMEOUT:
+            /* SYN+ACK 重传超时: 回到 CLOSED */
+            sock->state = TCP_CLOSED;
+            if (sock->on_error) sock->on_error(sock);
+            return true;
+
+        default:
+            return false;
+        }
+        break;
+
+    /* ======== ESTABLISHED ======== */
+    case TCP_ESTABLISHED:
+        switch (event) {
+        case TCP_EVENT_RCV_ACK:
+            /* 收到 ACK: 更新发送序列号 */
+            sock->snd_nxt = ext_seq;
+            return true;
+
+        case TCP_EVENT_RCV_FIN:
+            /* 收到 FIN: 回复 ACK, 进入 CLOSE_WAIT */
+            sock->rcv_nxt = ext_seq + 1;
+            sock->state = TCP_CLOSE_WAIT;
+            /* 动作: 发送 ACK */
+            /* tcp_send_segment(sock, TCP_FLAG_ACK); */
+            return true;
+
+        case TCP_EVENT_APP_CLOSE:
+            /* 上层主动关闭: 发送 FIN, 进入 FIN_WAIT_1 */
+            sock->state = TCP_FIN_WAIT_1;
+            /* sock->snd_nxt = ...; */
+            /* 动作: 发送 FIN (seq=snd_nxt) */
+            /* tcp_send_segment(sock, TCP_FLAG_FIN | TCP_FLAG_ACK); */
+            return true;
+
+        case TCP_EVENT_RCV_RST:
+            /* 收到 RST: 直接关闭 */
+            sock->state = TCP_CLOSED;
+            if (sock->on_error) sock->on_error(sock);
+            if (sock->on_closed) sock->on_closed(sock);
+            return true;
+
+        default:
+            return false;
+        }
+        break;
+
+    /* ======== CLOSE_WAIT ======== */
+    case TCP_CLOSE_WAIT:
+        switch (event) {
+        case TCP_EVENT_APP_CLOSE:
+            /* 上层处理完数据后关闭: 发送 FIN, 进入 LAST_ACK */
+            sock->state = TCP_LAST_ACK;
+            /* 动作: 发送 FIN */
+            /* tcp_send_segment(sock, TCP_FLAG_FIN | TCP_FLAG_ACK); */
+            return true;
+
+        default:
+            return false;
+        }
+        break;
+
+    /* ======== LAST_ACK ======== */
+    case TCP_LAST_ACK:
+        switch (event) {
+        case TCP_EVENT_RCV_ACK:
+            /* 收到对 FIN 的 ACK: 连接彻底关闭 */
+            sock->state = TCP_CLOSED;
+            if (sock->on_closed) sock->on_closed(sock);
+            return true;
+
+        case TCP_EVENT_TIMEOUT:
+            /* 超时: 强制关闭 */
+            sock->state = TCP_CLOSED;
+            if (sock->on_closed) sock->on_closed(sock);
+            return true;
+
+        default:
+            return false;
+        }
+        break;
+
+    /* ======== FIN_WAIT_1 ======== */
+    case TCP_FIN_WAIT_1:
+        switch (event) {
+        case TCP_EVENT_RCV_ACK:
+            /* 收到对 FIN 的 ACK: 等待对端 FIN */
+            sock->state = TCP_FIN_WAIT_2;
+            return true;
+
+        case TCP_EVENT_RCV_FIN:
+            /* 收到 FIN (对端同时关闭): 回复 ACK, 进入 TIME_WAIT */
+            sock->rcv_nxt = ext_seq + 1;
+            sock->state = TCP_TIME_WAIT;
+            sock->timewait_timer_ms = 0;
+            /* 动作: 发送 ACK */
+            /* tcp_send_segment(sock, TCP_FLAG_ACK); */
+            return true;
+
+        default:
+            return false;
+        }
+        break;
+
+    /* ======== FIN_WAIT_2 ======== */
+    case TCP_FIN_WAIT_2:
+        switch (event) {
+        case TCP_EVENT_RCV_FIN:
+            /* 收到对端 FIN: 回复 ACK, 进入 TIME_WAIT */
+            sock->rcv_nxt = ext_seq + 1;
+            sock->state = TCP_TIME_WAIT;
+            sock->timewait_timer_ms = 0;
+            /* 动作: 发送 ACK */
+            /* tcp_send_segment(sock, TCP_FLAG_ACK); */
+            return true;
+
+        case TCP_EVENT_TIMEOUT:
+            /* 等待超时: 直接关闭 */
+            sock->state = TCP_CLOSED;
+            if (sock->on_closed) sock->on_closed(sock);
+            return true;
+
+        default:
+            return false;
+        }
+        break;
+
+    /* ======== TIME_WAIT ======== */
+    case TCP_TIME_WAIT:
+        switch (event) {
+        case TCP_EVENT_TIMEOUT:
+            /* 2MSL 超时: 进入 CLOSED */
+            sock->state = TCP_CLOSED;
+            if (sock->on_closed) sock->on_closed(sock);
+            return true;
+
+        default:
+            /* TIME_WAIT 状态只接受超时事件, 其他报文(如 FIN 重传) */
+            /* 需要重新发送 ACK 但不改变状态 -- 这里简化处理 */
+            return false;
+        }
+        break;
+    }
+
+    return false;
+}
+
+/* ============================================================ */
+/* TCP 定时器管理                                               */
+/* ============================================================ */
+
+/**
+ * TCP 连接定时器更新 -- 用于 TIME_WAIT 超时
+ * 在主循环中周期性调用, 更新 TCP 连接的计时器
+ */
+void tcp_timer_tick(tcp_sock_t *sock, uint32_t elapsed_ms) {
+    switch (sock->state) {
+    case TCP_SYN_RCVD:
+        /* SYN+ACK 重传定时器 (简化: 3 秒超时关闭) */
+        /* 实际实现需要重传逻辑, 这里仅作示例 */
+        break;
+
+    case TCP_TIME_WAIT:
+        /* TIME_WAIT: 2MSL = 2 * 2 * RTT, 通常取 60 秒 */
+        sock->timewait_timer_ms += elapsed_ms;
+        if (sock->timewait_timer_ms >= 60000) {
+            tcp_state_machine_handle(sock, TCP_EVENT_TIMEOUT, 0, 0);
+        }
+        break;
+
+    case TCP_FIN_WAIT_2:
+        /* FIN_WAIT_2 超时: 防止对端不发送 FIN 导致死等 */
+        sock->timewait_timer_ms += elapsed_ms;
+        if (sock->timewait_timer_ms >= 60000) {
+            tcp_state_machine_handle(sock, TCP_EVENT_TIMEOUT, 0, 0);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/**
+ * 初始化 TCP 连接控制块 (服务器模式)
+ */
+void tcp_sock_init_server(tcp_sock_t *sock, uint16_t local_port,
+                          void (*send_frame)(const uint8_t *, uint16_t)) {
+    memset(sock, 0, sizeof(tcp_sock_t));
+    sock->state       = TCP_LISTEN;  /* 服务器启动即进入 LISTEN */
+    sock->local_port  = local_port;
+    sock->send_frame  = send_frame;
+}
+```
+
+#### C.3.3 MCU 场景 TCP 状态机简化点
+
+**为什么去掉 SYN_SENT**：在 MCU 服务器场景中，设备通常不主动发起 TCP 连接，因此 SYN_SENT、SYN_RCVD（客户端侧）等状态可以省略。如果 MCU 同时作为客户端，需要补充这些状态。
+
+**TIME_WAIT 的处理**：完整 TCP 实现中 TIME_WAIT 需要 2MSL（通常 2 分钟）等待，在 MCU 环境下往往简化为 30-60 秒或直接使用 RST 快速回收。有些轻量实现甚至直接跳过 TIME_WAIT 直接进入 CLOSED。
+
+**重传机制**：简化状态机未实现完整的超时重传（RTO）。在生产代码中，SYN_RCVD 和 LAST_ACK 状态的超时事件应触发重传（通常重试 3 次，每次间隔翻倍）。
+
+---
+
+### C.4 链路检测状态机 (PHY Link Detection)
+
+PHY 链路检测状态机专门处理物理链路的抖动（flapping）问题。当电缆接触不良或电磁干扰导致链路快速上下波动时，软件需要去抖（debouce）逻辑来防止状态频繁切换。
+
+#### C.4.1 状态图
+
+```
+                      +-------------------+
+                      |    LINK_WAIT      | <-- 初始状态 / 链路断开等待
+                      +--------+----------+
+                               |
+                       (PHY BMSR.2=1,
+                        链路物理 UP)
+                               |
+                               v
+                      +--------+----------+
+               +----->| PRE_LINK_UP      | <-- 去抖确认中
+               |      +--------+----------+
+               |               |
+               |      (去抖计时器到时, 连续 N 次检测到 LINK UP)
+               |               |
+               |               v
+               |      +--------+----------+
+               |      |    LINK_UP        | <-- 链路稳定运行
+               |      +--------+----------+
+               |               |
+               |      (PHY BMSR.2=0,
+               |       链路断开)
+               |               |
+               |               v
+               |      +--------+----------+
+               |      |  PRE_LINK_DOWN   | <-- 去抖确认断开
+               |      +--------+----------+
+               |               |
+               |      (去抖计时器到时, 连续 N 次检测到 LINK DOWN)
+               |               |
+               |               v
+               |      +--------+----------+
+               |      |   LINK_DOWN      | <-- 确认链路断开
+               |      +--------+----------+
+               |               |
+               |      (电缆恢复,           (超过重试次数,
+               |       BMSR.2=1)          进入错误处理)
+               |               |               |
+               |               v               v
+               |      +--------+----------+   +---------+
+               +------+   LINK_RECOVERY  |   |  ERROR  |
+                      +------------------+   +---------+
+```
+
+#### C.4.2 C 代码实现 (带去抖逻辑)
+
+```c
+#include <stdint.h>
+#include <stdbool.h>
+
+/* ============================================================ */
+/* PHY 链路检测状态机 (带去抖逻辑)                              */
+/* ============================================================ */
+
+/* ----- 去抖参数可配置 ----- */
+#define LINK_DEBOUNCE_UP_MS   200   /* 链路 UP 去抖时间 (ms) */
+#define LINK_DEBOUNCE_DOWN_MS 300   /* 链路 DOWN 去抖时间 (ms) */
+#define LINK_POLL_MS          50    /* PHY 轮询间隔 (ms) */
+#define LINK_RECOVERY_MAX     3     /* 最大恢复尝试次数 */
+
+/* ----- 状态定义 ----- */
+typedef enum {
+    LINK_STATE_WAIT,          /* 初始等待态 */
+    LINK_STATE_PRE_UP,        /* 链路 UP 去抖中 */
+    LINK_STATE_UP,            /* 链路已建立且稳定 */
+    LINK_STATE_PRE_DOWN,      /* 链路 DOWN 去抖中 */
+    LINK_STATE_DOWN,          /* 链路确认断开 */
+    LINK_STATE_RECOVERY,      /* 尝试恢复 */
+    LINK_STATE_ERROR,         /* 错误态 */
+} link_state_t;
+
+/* ----- 状态机上下文 ----- */
+typedef struct {
+    link_state_t state;           /* 当前状态 */
+    uint8_t      phy_addr;        /* PHY 地址 */
+    uint32_t     debounce_timer;  /* 去抖计时器 (ms) */
+    uint8_t      recovery_count;  /* 恢复尝试计数 */
+    uint32_t     stable_time_ms;  /* LINK_UP 稳定时间 (统计用) */
+
+    /* 回调函数 */
+    void (*on_link_up_cb)(void);
+    void (*on_link_down_cb)(void);
+
+    /* PHY 寄存器读取 (由 MDIO 层提供) */
+    uint16_t (*phy_read)(uint8_t addr, uint8_t reg);
+} link_detect_t;
+
+/* ============================================================ */
+/* 状态机主循环                                                 */
+/* ============================================================ */
+
+/**
+ * 链路检测状态机 -- 每次 PHY 轮询时调用
+ *
+ * ctx:    状态机上下文
+ * poll_ms: 自上次调用以来的时间 (ms)
+ *
+ * 返回: true 表示链路当前处于 UP 状态
+ */
+bool link_detect_state_machine_run(link_detect_t *ctx, uint32_t poll_ms) {
+    /* 读取 PHY 链路状态 (两次读取清除锁存) */
+    (void)ctx->phy_read(ctx->phy_addr, 0x01);           /* 清除锁存 */
+    uint16_t bmsr = ctx->phy_read(ctx->phy_addr, 0x01); /* 真实值 */
+    bool phy_link_up = (bmsr & 0x0004) ? true : false;
+
+    switch (ctx->state) {
+
+    /* ======== WAIT: 等待链路首次 UP ======== */
+    case LINK_STATE_WAIT:
+        if (phy_link_up) {
+            /* 检测到链路 UP: 启动去抖 */
+            ctx->debounce_timer = 0;
+            ctx->state = LINK_STATE_PRE_UP;
+        }
+        break;
+
+    /* ======== PRE_UP: 链路 UP 去抖确认 ======== */
+    case LINK_STATE_PRE_UP:
+        ctx->debounce_timer += poll_ms;
+
+        if (!phy_link_up) {
+            /* 去抖期间链路又断了: 复位去抖, 回到 WAIT */
+            ctx->debounce_timer = 0;
+            ctx->state = LINK_STATE_WAIT;
+            break;
+        }
+
+        if (ctx->debounce_timer >= LINK_DEBOUNCE_UP_MS) {
+            /* 连续 LINK_DEBOUNCE_UP_MS 时间内始终 UP: 确认 */
+            ctx->stable_time_ms    = 0;
+            ctx->recovery_count    = 0;
+            ctx->state = LINK_STATE_UP;
+            /* 入口动作: 通知上层链路 UP */
+            if (ctx->on_link_up_cb) ctx->on_link_up_cb();
+        }
+        break;
+
+    /* ======== UP: 正常运行态 ======== */
+    case LINK_STATE_UP:
+        ctx->stable_time_ms += poll_ms;  /* 记录稳定运行时间 */
+
+        if (!phy_link_up) {
+            /* 检测到链路 DOWN: 启动去抖 */
+            ctx->debounce_timer = 0;
+            ctx->state = LINK_STATE_PRE_DOWN;
+        }
+        break;
+
+    /* ======== PRE_DOWN: 链路 DOWN 去抖确认 ======== */
+    case LINK_STATE_PRE_DOWN:
+        ctx->debounce_timer += poll_ms;
+
+        if (phy_link_up) {
+            /* 去抖期间链路恢复了: 回到 UP */
+            ctx->debounce_timer = 0;
+            ctx->state = LINK_STATE_UP;
+            break;
+        }
+
+        if (ctx->debounce_timer >= LINK_DEBOUNCE_DOWN_MS) {
+            /* 确认链路断开 */
+            ctx->state = LINK_STATE_DOWN;
+            /* 入口动作: 通知上层链路 DOWN */
+            if (ctx->on_link_down_cb) ctx->on_link_down_cb();
+        }
+        break;
+
+    /* ======== DOWN: 链路确认断开 ======== */
+    case LINK_STATE_DOWN:
+        if (phy_link_up) {
+            /* 链路恢复: 尝试重新建立 */
+            ctx->state = LINK_STATE_RECOVERY;
+            ctx->debounce_timer = 0;
+        }
+        break;
+
+    /* ======== RECOVERY: 恢复后去抖 ======== */
+    case LINK_STATE_RECOVERY:
+        ctx->debounce_timer += poll_ms;
+
+        if (!phy_link_up) {
+            /* 恢复失败: 计数器 +1 */
+            ctx->recovery_count++;
+            ctx->debounce_timer = 0;
+
+            if (ctx->recovery_count >= LINK_RECOVERY_MAX) {
+                ctx->state = LINK_STATE_ERROR;
+            } else {
+                ctx->state = LINK_STATE_DOWN;  /* 等待下一次恢复 */
+            }
+            break;
+        }
+
+        if (ctx->debounce_timer >= LINK_DEBOUNCE_UP_MS) {
+            /* 恢复成功 */
+            ctx->recovery_count = 0;
+            ctx->stable_time_ms = 0;
+            ctx->state = LINK_STATE_UP;
+            if (ctx->on_link_up_cb) ctx->on_link_up_cb();
+        }
+        break;
+
+    /* ======== ERROR: 错误处理 ======== */
+    case LINK_STATE_ERROR:
+        /* 定时重试: 每 10 秒尝试一次 */
+        ctx->debounce_timer += poll_ms;
+        if (ctx->debounce_timer >= 10000) {
+            ctx->debounce_timer  = 0;
+            ctx->recovery_count  = 0;
+            ctx->state = LINK_STATE_WAIT;  /* 从头开始检测 */
+        }
+        break;
+    }
+
+    return (ctx->state == LINK_STATE_UP);
+}
+
+/**
+ * 初始化链路检测状态机
+ */
+void link_detect_init(link_detect_t *ctx, uint8_t phy_addr,
+                      uint16_t (*phy_read)(uint8_t, uint8_t),
+                      void (*on_up)(void), void (*on_down)(void))
+{
+    ctx->state          = LINK_STATE_WAIT;
+    ctx->phy_addr       = phy_addr;
+    ctx->debounce_timer = 0;
+    ctx->recovery_count = 0;
+    ctx->stable_time_ms = 0;
+    ctx->phy_read       = phy_read;
+    ctx->on_link_up_cb  = on_up;
+    ctx->on_link_down_cb = on_down;
+}
+```
+
+#### C.4.3 去抖时序图解
+
+```
+PHY BMSR.2 (物理链路):
+   ┌──────┐         ┌──────┐           ┌──────┐
+   │      │         │      │           │      │
+───┘      └─────────┘      └───────────┘      └────
+    ^ 干扰  ^               ^ 干扰
+    (50ms)  (100ms)         (30ms)
+
+无去抖时软件状态:
+   ┌─┐   ┌─┐         ┌─┐   ┌─┐
+   │ │   │ │         │ │   │ │
+───┘ └───┘ └─────────┘ └───┘ └──────────────────
+    UP DOWN UP DOWN   ...   (频繁跳变, 不可接受)
+
+有去抖时软件状态 (PRE_UP=200ms, PRE_DOWN=300ms):
+                            ┌──────────────
+                            │
+────────────────────────────┘
+                            只有持续 UP 超过 200ms 才算 UP
+                            只有持续 DOWN 超过 300ms 才算 DOWN
+                            (去抖滤除了短暂的毛刺)
+```
+
+#### C.4.4 链路状态机与 PHY 驱动状态机的协作
+
+链路检测状态机位于 PHY 驱动状态机之下，两者是协作关系：
+
+```
+┌─────────────────────────────────────────────────┐
+│             应用层 (App Layer)                    │
+├─────────────────────────────────────────────────┤
+│           TCP/UDP 协议栈                         │
+├─────────────────────────────────────────────────┤
+│     C.1 ARP 缓存状态机 ←→ C.3 TCP 状态机          │
+├─────────────────────────────────────────────────┤
+│  第九章 PHY 驱动状态机 (phy_state_machine_tick)    │
+│     ├── C.2 Auto-Neg 状态机 (ANEG子过程)          │
+│     └── C.4 链路检测状态机 (Link 监控)            │
+├─────────────────────────────────────────────────┤
+│              PHY 硬件 (寄存器层)                  │
+└─────────────────────────────────────────────────┘
+```
+
+- PHY 驱动状态机的 `LINK_UP` / `LINK_DOWN` 状态使用本节的链路检测状态机作为去抖过滤器
+- 链路检测状态机的 `on_link_up_cb` 回调触发 PHY 驱动状态机中的链接恢复流程
+- `on_link_down_cb` 回调通知协议栈 (ARP 缓存需要清除，TCP 连接需要断开)
+
+---
+
+### C.5 状态机通用设计模式总结
+
+#### 嵌入式网络协议栈中状态机的共性设计模式
+
+1. **枚举 + switch-case 模式**：使用 `typedef enum` 定义状态集，通过 `switch(state)` 分发事件，每个 case 内实现状态转换逻辑。这是 MCU 环境最高效、最可读的实现方式。
+
+2. **状态进入/退出动作**：在状态转换的前后执行动作，典型实现方式：
+   ```c
+   /* 退出旧状态 */
+   exit_action(old_state);
+   /* 执行状态转换 */
+   state = new_state;
+   /* 进入新状态 */
+   entry_action(new_state);
+   ```
+
+3. **定时器驱动**：每个状态维护独立的计时器（`state_timer_ms`），在状态机 tick 函数中累加并检查超时，驱动超时事件。
+
+4. **事件驱动 + 轮询混合**：报文接收产生事件（如 ARP 应答到达、TCP SYN 到达），通过事件队列驱动状态机；定时超时通过轮询 tick 函数驱动。
+
+5. **状态表查询 (可选优化)**：当状态-事件对较多时，可以用二维函数指针表替代 switch-case，提高可扩展性：
+   ```c
+   typedef bool (*state_handler_t)(void *ctx, event_t evt, void *data);
+   state_handler_t state_table[MAX_STATE][MAX_EVENT];
+   ```
+
+6. **层次状态机 (HSM)**：TCP 状态机天然具有层次性（ESTABLISHED 和 CLOSE_WAIT 共享 "已连接" 的公共行为），在复杂应用中可以将公共行为提取到父状态。但在 MCU 场景中，扁平状态机通常已经足够且更易调试。
+
+---
+
+### C.6 状态机调试技巧
+
+**调试状态机最有效的方法**：日志 + 状态转储。
+
+```c
+/* 通用状态机日志宏 */
+#define SM_DEBUG(state, event, format, ...) \
+    do { \
+        printf("[SM] %s -> event=%s: " format "\r\n", \
+               state_name(state), event_name(event), ##__VA_ARGS__); \
+    } while (0)
+
+/* 状态转储: 打印所有 ARP 缓存表的状态 */
+void arp_cache_dump(arp_cache_table_t *tbl) {
+    const char *state_str[] = {"IDLE","RESOLVING","RESOLVED","STALE"};
+    printf("--- ARP Cache Dump ---\r\n");
+    for (int i = 0; i < ARP_CACHE_SIZE; i++) {
+        if (!tbl->entries[i].valid) continue;
+        printf("  [%d] IP=%08lX State=%s Retry=%d Timer=%lu\r\n",
+               i, tbl->entries[i].ip_addr,
+               state_str[tbl->entries[i].state],
+               tbl->entries[i].retry_count,
+               tbl->entries[i].state_timer_ms);
+    }
+}
+```
+
+**状态机调试清单**：
+- 每个状态都有意料之外的输入时如何处理（防御性编程）
+- 状态转换后计时器是否正确复位（防止残留计时器导致意外超时）
+- 去抖参数是否与 PHY 硬件特性匹配（不同 PHY 的 Link Status 稳定时间不同）
+- 状态机在 RESET/INIT 时是否进入确定的初始状态
+- 是否存在死锁状态（无任何事件能离开的状态）
+
+---
+
+## Appendix D: Copy-Paste C Code Templates
+
+> 本章节提供了一套完整的 C 语言代码模板，覆盖 MCU 以太网编程中最常用的基础功能。每个模板都是独立可编译的，可以直接复制到您的项目中修改使用。代码以 **ARM Cortex-M** (小端序, 32位) 为默认目标平台，但大部分代码是平台无关的。
+
+---
+
+### D.1 CRC32 Calculation (Ethernet FCS)
+
+**功能**：计算 IEEE 802.3 标准 CRC32，用于以太网帧的 FCS (Frame Check Sequence) 校验。
+
+**算法说明**：
+- 多项式：`0x04C11DB7`（反射表示为 `0xEDB88320`）
+- 初始值：`0xFFFFFFFF`
+- 异或输出：`0xFFFFFFFF`
+- 使用查表法加速（256 项查找表）
+
+```c
+/**
+ * crc32.h - IEEE 802.3 CRC32 实现
+ *
+ * 使用方法：
+ *   uint8_t data[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, ...};
+ *   uint32_t crc = crc32_calculate(data, sizeof(data));
+ *   // crc 即为 FCS 值（4 字节），以小端序附加到帧尾
+ *
+ * 编译测试：
+ *   gcc -DTEST_CRC32 -o test_crc32 crc32.c && ./test_crc32
+ */
+
+#include <stdint.h>
+#include <stddef.h>
+
+/* CRC32 查找表 */
+static uint32_t crc32_table[256];
+static uint8_t  crc32_table_initialized = 0;
+
+/**
+ * 生成 CRC32 查找表（仅执行一次）
+ * 多项式：0xEDB88320（0x04C11DB7 的反射表示）
+ */
+static void crc32_init_table(void)
+{
+    uint32_t crc;
+    for (uint32_t i = 0; i < 256; i++)
+    {
+        crc = i;
+        for (int j = 0; j < 8; j++)
+        {
+            if (crc & 1)
+                crc = (crc >> 1) ^ 0xEDB88320;
+            else
+                crc = (crc >> 1);
+        }
+        crc32_table[i] = crc;
+    }
+    crc32_table_initialized = 1;
+}
+
+/**
+ * 计算 IEEE 802.3 CRC32
+ * @param data  输入数据指针
+ * @param len   数据长度（字节）
+ * @return      32 位 CRC 值
+ */
+uint32_t crc32_calculate(const uint8_t *data, uint32_t len)
+{
+    uint32_t crc = 0xFFFFFFFF;
+
+    if (!crc32_table_initialized)
+        crc32_init_table();
+
+    for (uint32_t i = 0; i < len; i++)
+    {
+        uint8_t index = (uint8_t)((crc ^ data[i]) & 0xFF);
+        crc = (crc >> 8) ^ crc32_table[index];
+    }
+
+    return crc ^ 0xFFFFFFFF;
+}
+
+#if defined(TEST_CRC32)
+#include <stdio.h>
+
+int main(void)
+{
+    /* 测试向量："123456789" */
+    const uint8_t test[] = "123456789";
+    uint32_t crc = crc32_calculate(test, 9);
+    printf("CRC32(\"123456789\") = 0x%08lX (expect 0xCBF43926)\n",
+           (unsigned long)crc);
+
+    /* 测试空数据 */
+    crc = crc32_calculate(NULL, 0);
+    printf("CRC32(empty) = 0x%08lX (expect 0x00000000)\n",
+           (unsigned long)crc);
+
+    return 0;
+}
+#endif /* TEST_CRC32 */
+```
+
+**用法示例**：
+```c
+/* 计算以太网帧的 CRC32 并附加 FCS */
+void ethernet_send_frame(uint8_t *frame, uint32_t len)
+{
+    uint32_t fcs = crc32_calculate(frame, len);
+
+    /* 将 FCS 以小端序写入帧尾部 */
+    frame[len + 0] = (uint8_t)( fcs        & 0xFF);
+    frame[len + 1] = (uint8_t)((fcs >> 8)  & 0xFF);
+    frame[len + 2] = (uint8_t)((fcs >> 16) & 0xFF);
+    frame[len + 3] = (uint8_t)((fcs >> 24) & 0xFF);
+
+    /* 发送 len + 4 字节到 MAC */
+    MAC_send(frame, len + 4);
+}
+
+/* 验证收到的帧 CRC 是否正确 */
+int ethernet_verify_fcs(const uint8_t *frame, uint32_t len)
+{
+    if (len < 4) return 0;
+
+    uint32_t received_fcs = (uint32_t)frame[len - 4] |
+                           ((uint32_t)frame[len - 3] << 8) |
+                           ((uint32_t)frame[len - 2] << 16) |
+                           ((uint32_t)frame[len - 1] << 24);
+
+    uint32_t calc_fcs = crc32_calculate(frame, len - 4);
+
+    return (calc_fcs == received_fcs);
+}
+```
+
+---
+
+### D.2 MAC Address Utilities
+
+**功能**：MAC 地址的格式化、解析、类型判断和比较。
+
+```c
+/**
+ * mac_utils.h - MAC 地址工具函数
+ *
+ * 所有函数均不依赖外部库（不调用 sprintf/sscanf），
+ * 适用于裸机 MCU 环境。
+ *
+ * 编译测试：
+ *   gcc -DTEST_MAC -o test_mac mac_utils.c && ./test_mac
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+#define MAC_ADDR_LEN    6
+#define MAC_STR_LEN     18  /* "AA:BB:CC:DD:EE:FF\0" */
+
+/**
+ * 将 MAC 地址转换为字符串 "AA:BB:CC:DD:EE:FF"
+ * @param mac  6 字节 MAC 地址
+ * @param str  输出缓冲区（至少 18 字节）
+ */
+void mac_to_string(const uint8_t *mac, char *str)
+{
+    const char hex[] = "0123456789ABCDEF";
+    str[0]  = hex[(mac[0] >> 4) & 0x0F];
+    str[1]  = hex[ mac[0]       & 0x0F];
+    str[2]  = ':';
+    str[3]  = hex[(mac[1] >> 4) & 0x0F];
+    str[4]  = hex[ mac[1]       & 0x0F];
+    str[5]  = ':';
+    str[6]  = hex[(mac[2] >> 4) & 0x0F];
+    str[7]  = hex[ mac[2]       & 0x0F];
+    str[8]  = ':';
+    str[9]  = hex[(mac[3] >> 4) & 0x0F];
+    str[10] = hex[ mac[3]       & 0x0F];
+    str[11] = ':';
+    str[12] = hex[(mac[4] >> 4) & 0x0F];
+    str[13] = hex[ mac[4]       & 0x0F];
+    str[14] = ':';
+    str[15] = hex[(mac[5] >> 4) & 0x0F];
+    str[16] = hex[ mac[5]       & 0x0F];
+    str[17] = '\0';
+}
+
+/**
+ * 将字符串 "AA:BB:CC:DD:EE:FF" 解析为 MAC 地址
+ * @param str  输入字符串（支持大写/小写十六进制）
+ * @param mac  输出缓冲区（6 字节）
+ * @return     成功返回 1，失败返回 0
+ */
+int string_to_mac(const char *str, uint8_t *mac)
+{
+    for (int i = 0; i < 6; i++)
+    {
+        uint8_t nibble_high = 0, nibble_low = 0;
+
+        char c = str[i * 3];
+        if      (c >= '0' && c <= '9') nibble_high = (uint8_t)(c - '0');
+        else if (c >= 'A' && c <= 'F') nibble_high = (uint8_t)(c - 'A' + 10);
+        else if (c >= 'a' && c <= 'f') nibble_high = (uint8_t)(c - 'a' + 10);
+        else return 0;
+
+        c = str[i * 3 + 1];
+        if      (c >= '0' && c <= '9') nibble_low = (uint8_t)(c - '0');
+        else if (c >= 'A' && c <= 'F') nibble_low = (uint8_t)(c - 'A' + 10);
+        else if (c >= 'a' && c <= 'f') nibble_low = (uint8_t)(c - 'a' + 10);
+        else return 0;
+
+        mac[i] = (nibble_high << 4) | nibble_low;
+
+        if (i < 5 && str[i * 3 + 2] != ':')
+            return 0;
+    }
+    return 1;
+}
+
+/**
+ * 判断是否为广播地址 (FF:FF:FF:FF:FF:FF)
+ */
+bool mac_is_broadcast(const uint8_t *mac)
+{
+    return (mac[0] == 0xFF && mac[1] == 0xFF &&
+            mac[2] == 0xFF && mac[3] == 0xFF &&
+            mac[4] == 0xFF && mac[5] == 0xFF);
+}
+
+/**
+ * 判断是否为组播地址
+ * 组播标志：MAC 第一字节的最低位为 1
+ */
+bool mac_is_multicast(const uint8_t *mac)
+{
+    return (mac[0] & 0x01) != 0;
+}
+
+/**
+ * 判断是否为单播地址
+ * 单播标志：MAC 第一字节的最低位为 0
+ */
+bool mac_is_unicast(const uint8_t *mac)
+{
+    return (mac[0] & 0x01) == 0;
+}
+
+/**
+ * 比较两个 MAC 地址是否相等
+ * @return 相等返回 1，不等返回 0
+ */
+int mac_compare(const uint8_t *mac1, const uint8_t *mac2)
+{
+    return (mac1[0] == mac2[0] && mac1[1] == mac2[1] &&
+            mac1[2] == mac2[2] && mac1[3] == mac2[3] &&
+            mac1[4] == mac2[4] && mac1[5] == mac2[5]);
+}
+
+#if defined(TEST_MAC)
+#include <stdio.h>
+
+int main(void)
+{
+    uint8_t mac[6];
+    char    str[MAC_STR_LEN];
+
+    uint8_t test_mac[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+    mac_to_string(test_mac, str);
+    printf("mac_to_string: %s (expect AA:BB:CC:DD:EE:FF)\n", str);
+
+    int ret = string_to_mac("12:34:56:78:9A:BC", mac);
+    printf("string_to_mac ret=%d: %02X:%02X:%02X:%02X:%02X:%02X\n",
+           ret, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+    uint8_t bc[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    uint8_t mc[] = {0x01, 0x00, 0x5E, 0x00, 0x00, 0x01};
+    uint8_t uc[] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+
+    printf("is_broadcast(FF:...):  %d (expect 1)\n", mac_is_broadcast(bc));
+    printf("is_multicast(01:...):  %d (expect 1)\n", mac_is_multicast(mc));
+    printf("is_unicast(00:...):    %d (expect 1)\n", mac_is_unicast(uc));
+    printf("is_multicast(FF:...):  %d (expect 1, broadcast is also multicast)\n",
+           mac_is_multicast(bc));
+
+    uint8_t mac1[] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    uint8_t mac2[] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x55};
+    uint8_t mac3[] = {0x00, 0x11, 0x22, 0x33, 0x44, 0x56};
+    printf("mac_compare(equal):  %d (expect 1)\n", mac_compare(mac1, mac2));
+    printf("mac_compare(differ): %d (expect 0)\n", mac_compare(mac1, mac3));
+
+    return 0;
+}
+#endif /* TEST_MAC */
+```
+
+**用法示例**：
+```c
+void eth_process_received_frame(const uint8_t *frame, uint32_t len)
+{
+    const uint8_t *dst_mac = &frame[0];
+    const uint8_t *src_mac = &frame[6];
+
+    if (mac_is_broadcast(dst_mac))
+    {
+        printf("RX: broadcast frame\n");
+        process_arp_request(frame, len);
+    }
+    else if (mac_is_multicast(dst_mac))
+    {
+        if (mac_compare(dst_mac, our_mcast_group))
+            process_igmp_frame(frame, len);
+    }
+    else if (mac_is_unicast(dst_mac))
+    {
+        if (mac_compare(dst_mac, our_mac))
+            process_unicast_frame(frame, len);
+    }
+
+    char mac_str[MAC_STR_LEN];
+    mac_to_string(src_mac, mac_str);
+    printf("  from %s\n", mac_str);
+}
+```
+
+---
+
+### D.3 IP Utilities
+
+**功能**：IP 协议栈核心工具函数 -- 互联网校验和、IP 地址字符串互转和组播判断。
+
+```c
+/**
+ * ip_utils.h - IP 层工具函数
+ *
+ * 编译测试：
+ *   gcc -DTEST_IP -o test_ip ip_utils.c && ./test_ip
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+/**
+ * 计算互联网校验和 (RFC 1071)
+ *
+ * 对 16 位字进行反码求和，结果取反。
+ * 使用前将校验和字段清零，计算后填入返回值。
+ *
+ * @param buf    数据缓冲区
+ * @param len    数据长度（字节）
+ * @return       16 位校验和（已取反）
+ */
+uint16_t ip_checksum(const uint8_t *buf, int len)
+{
+    uint32_t sum = 0;
+
+    for (int i = 0; i < len; i += 2)
+    {
+        uint16_t word;
+        word  = (uint16_t)((uint16_t)buf[i] << 8);
+        if (i + 1 < len)
+            word |= (uint16_t)buf[i + 1];
+        sum += word;
+    }
+
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+
+    return (uint16_t)(~sum & 0xFFFF);
+}
+
+/**
+ * 将 32 位 IP 地址（网络字节序）转换为字符串 "192.168.1.1"
+ * @param ip   网络字节序的 IP 地址
+ * @param str  输出缓冲区（至少 16 字节）
+ */
+void ip_to_string(uint32_t ip, char *str)
+{
+    uint8_t *bytes = (uint8_t *)&ip;
+    uint8_t octets[4] = {bytes[0], bytes[1], bytes[2], bytes[3]};
+    char *p = str;
+
+    for (int i = 0; i < 4; i++)
+    {
+        uint8_t val = octets[i];
+
+        if (val >= 100) { *p++ = (char)('0' + val / 100); val %= 100; }
+        if (val >= 10)   *p++ = (char)('0' + val / 10);
+        else if (octets[i] < 10 && i > 0 && p > str && *(p-1) >= '0')
+            { /* 中间八位组小于 10 时需补 0 */ }
+        val %= 10;
+        *p++ = (char)('0' + val);
+        if (i < 3) *p++ = '.';
+    }
+    *p = '\0';
+}
+
+/**
+ * 将字符串 "192.168.1.1" 解析为 32 位 IP 地址（网络字节序）
+ * @param str  输入字符串
+ * @param ip   输出 IP 地址（网络字节序）
+ * @return     成功返回 1，失败返回 0
+ */
+int string_to_ip(const char *str, uint32_t *ip)
+{
+    uint8_t octets[4] = {0, 0, 0, 0};
+    int     octet_idx = 0;
+    uint16_t value    = 0;
+    char    c;
+
+    while ((c = *str++) != '\0')
+    {
+        if (c >= '0' && c <= '9')
+        {
+            value = (uint16_t)(value * 10 + (c - '0'));
+            if (value > 255) return 0;
+        }
+        else if (c == '.')
+        {
+            if (octet_idx >= 3) return 0;
+            octets[octet_idx++] = (uint8_t)value;
+            value = 0;
+        }
+        else
+        {
+            return 0;
+        }
+    }
+
+    if (octet_idx != 3) return 0;
+
+    octets[3] = (uint8_t)value;
+
+    *ip = ((uint32_t)octets[0] << 24) |
+          ((uint32_t)octets[1] << 16) |
+          ((uint32_t)octets[2] <<  8) |
+          ((uint32_t)octets[3]      );
+
+    return 1;
+}
+
+/**
+ * 判断 IP 地址是否为组播地址
+ * 组播范围：224.0.0.0 ~ 239.255.255.255 (224.0.0.0/4)
+ */
+bool ip_is_multicast(uint32_t ip)
+{
+    uint8_t first_byte = (uint8_t)(ip >> 24);
+    return (first_byte >= 224 && first_byte <= 239);
+}
+
+#if defined(TEST_IP)
+#include <stdio.h>
+
+int main(void)
+{
+    char str[16];
+
+    /* 测试校验和 */
+    {
+        uint8_t ip_header[] = {
+            0x45, 0x00, 0x00, 0x3C,
+            0x00, 0x00, 0x40, 0x00,
+            0x40, 0x01, 0x00, 0x00,
+            0xC0, 0xA8, 0x01, 0x01,
+            0xC0, 0xA8, 0x01, 0x02
+        };
+        uint16_t cksum = ip_checksum(ip_header, sizeof(ip_header));
+        ip_header[10] = (uint8_t)((cksum >> 8)  & 0xFF);
+        ip_header[11] = (uint8_t)( cksum        & 0xFF);
+        printf("IP checksum = 0x%04X\n", cksum);
+        printf("Verify = 0x%04X (expect 0x0000)\n",
+               ip_checksum(ip_header, sizeof(ip_header)));
+    }
+
+    /* 测试 IP 地址转换 */
+    {
+        uint32_t ip;
+        string_to_ip("192.168.1.1", &ip);
+        ip_to_string(ip, str);
+        printf("ip_to_string: %s (expect 192.168.1.1)\n", str);
+
+        string_to_ip("10.0.0.255", &ip);
+        ip_to_string(ip, str);
+        printf("ip_to_string: %s (expect 10.0.0.255)\n", str);
+    }
+
+    /* 测试组播判断 */
+    {
+        uint32_t ip;
+        string_to_ip("224.0.0.1", &ip);
+        printf("224.0.0.1 multicast: %d (expect 1)\n", ip_is_multicast(ip));
+
+        string_to_ip("192.168.1.1", &ip);
+        printf("192.168.1.1 multicast: %d (expect 0)\n", ip_is_multicast(ip));
+    }
+
+    return 0;
+}
+#endif /* TEST_IP */
+```
+
+**用法示例**：
+```c
+void build_ip_header(uint8_t *buf,
+                     uint32_t src_ip, uint32_t dst_ip,
+                     uint8_t protocol, uint16_t total_len)
+{
+    buf[0]  = 0x45;
+    buf[1]  = 0x00;
+    buf[2]  = (uint8_t)((total_len >> 8) & 0xFF);
+    buf[3]  = (uint8_t)( total_len       & 0xFF);
+    buf[4]  = 0x00;  buf[5]  = 0x00;
+    buf[6]  = 0x40;  buf[7]  = 0x00;
+    buf[8]  = 64;
+    buf[9]  = protocol;
+    buf[10] = 0x00;  buf[11] = 0x00;
+
+    uint32_t src_net = src_ip;
+    uint32_t dst_net = dst_ip;
+    memcpy(&buf[12], &src_net, 4);
+    memcpy(&buf[16], &dst_net, 4);
+
+    uint16_t cksum = ip_checksum(buf, 20);
+    buf[10] = (uint8_t)((cksum >> 8) & 0xFF);
+    buf[11] = (uint8_t)( cksum       & 0xFF);
+}
+```
+
+---
+
+### D.4 Network Byte Order
+
+**功能**：手动实现 htons/htonl/ntohs/ntohl，适用于没有标准 BSD Socket API 的裸机 MCU 环境。
+
+```c
+/**
+ * byteorder.h - 网络字节序转换（手动实现）
+ *
+ * 目标平台：小端 CPU（ARM Cortex-M, x86 等）
+ * 对于 GCC/Clang，推荐用内建函数：
+ *   __builtin_bswap16() 和 __builtin_bswap32()
+ *
+ * 编译测试：
+ *   gcc -DTEST_BYTEORDER -o test_byteorder byteorder.c && ./test_byteorder
+ */
+
+#include <stdint.h>
+
+/**
+ * 检测当前平台字节序
+ * 返回 1 表示小端，0 表示大端
+ */
+static inline int platform_is_little_endian(void)
+{
+    const uint16_t test = 0x0001;
+    const uint8_t *byte = (const uint8_t *)&test;
+    return (int)(byte[0] != 0);
+}
+
+static inline uint16_t swap16(uint16_t val)
+{
+    return (uint16_t)((val << 8) | (val >> 8));
+}
+
+static inline uint32_t swap32(uint32_t val)
+{
+    return (uint32_t)(((val << 24)) |
+                      ((val <<  8) & 0x00FF0000) |
+                      ((val >>  8) & 0x0000FF00) |
+                      ((val >> 24)));
+}
+
+static inline uint16_t htons(uint16_t val)
+{
+    if (platform_is_little_endian())
+        return swap16(val);
+    return val;
+}
+
+static inline uint16_t ntohs(uint16_t val)
+{
+    return htons(val);
+}
+
+static inline uint32_t htonl(uint32_t val)
+{
+    if (platform_is_little_endian())
+        return swap32(val);
+    return val;
+}
+
+static inline uint32_t ntohl(uint32_t val)
+{
+    return htonl(val);
+}
+
+/*
+ * 确定小端平台时，可用宏版本消除函数调用开销：
+ * #define HTONS(x)  (uint16_t)((((x) & 0xFF) << 8) | (((x) >> 8) & 0xFF))
+ * #define HTONL(x)  (uint32_t)((((x) & 0xFF000000) >> 24) | \
+ *                              (((x) & 0x00FF0000) >>  8) | \
+ *                              (((x) & 0x0000FF00) <<  8) | \
+ *                              (((x) & 0x000000FF) << 24))
+ * #define NTOHS(x)  HTONS(x)
+ * #define NTOHL(x)  HTONL(x)
+ */
+
+#if defined(TEST_BYTEORDER)
+#include <stdio.h>
+
+int main(void)
+{
+    printf("Platform is %s-endian\n",
+           platform_is_little_endian() ? "little" : "big");
+
+    uint16_t host16 = 0x1234;
+    uint16_t net16  = htons(host16);
+    printf("htons(0x%04X) = 0x%04X\n", host16, net16);
+    printf("ntohs(0x%04X) = 0x%04X\n", net16, ntohs(net16));
+
+    uint32_t host32 = 0x12345678;
+    uint32_t net32  = htonl(host32);
+    printf("htonl(0x%08lX) = 0x%08lX\n",
+           (unsigned long)host32, (unsigned long)net32);
+    printf("ntohl(0x%08lX) = 0x%08lX\n",
+           (unsigned long)net32, (unsigned long)ntohl(net32));
+
+    uint16_t udp_port = ntohs(0x0035);
+    printf("UDP port (DNS) = %u (expect 53)\n", udp_port);
+
+    return 0;
+}
+#endif /* TEST_BYTEORDER */
+```
+
+**用法示例**：
+```c
+void parse_udp_packet(const uint8_t *buf)
+{
+    typedef struct {
+        uint16_t src_port;    /* 网络字节序 */
+        uint16_t dst_port;
+        uint16_t length;
+        uint16_t checksum;
+    } __attribute__((packed)) udp_header_t;
+
+    const udp_header_t *udp = (const udp_header_t *)buf;
+
+    uint16_t src_port = ntohs(udp->src_port);
+    uint16_t dst_port = ntohs(udp->dst_port);
+    uint16_t len      = ntohs(udp->length);
+
+    if (dst_port == 53) { /* DNS */ }
+}
+```
+
+---
+
+### D.5 ARP Cache Implementation
+
+**功能**：完整的 ARP 缓存实现，支持 IP 到 MAC 的映射管理、自动老化。
+
+```c
+/**
+ * arp_cache.h - ARP 缓存实现
+ *
+ * 编译测试：
+ *   gcc -DTEST_ARP_CACHE -o test_arp arp_cache.c && ./test_arp
+ */
+
+#include <stdint.h>
+#include <string.h>
+#include <stdbool.h>
+
+/* ---------- 配置宏 ---------- */
+#define ARP_CACHE_SIZE         8
+#define ARP_TIMEOUT_SEC        300  /* RFC 1122 建议 >= 60s */
+#define MAC_ADDR_LEN           6
+
+#define ARP_STATE_INVALID      0
+#define ARP_STATE_RESOLVING    1
+#define ARP_STATE_VALID        2
+
+/* ---------- 数据结构 ---------- */
+
+typedef struct {
+    uint32_t ip_addr;
+    uint8_t  mac_addr[MAC_ADDR_LEN];
+    uint8_t  state;
+    uint16_t age_seconds;
+} arp_entry_t;
+
+typedef struct {
+    arp_entry_t entries[ARP_CACHE_SIZE];
+    uint32_t    lookups;
+    uint32_t    hits;
+} arp_cache_t;
+
+static arp_cache_t arp_cache;
+
+/* ---------- 函数实现 ---------- */
+
+void arp_cache_init(void)
+{
+    memset(&arp_cache, 0, sizeof(arp_cache));
+    for (int i = 0; i < ARP_CACHE_SIZE; i++)
+        arp_cache.entries[i].state = ARP_STATE_INVALID;
+}
+
+int arp_cache_lookup(uint32_t ip, uint8_t *mac_out)
+{
+    arp_cache.lookups++;
+
+    for (int i = 0; i < ARP_CACHE_SIZE; i++)
+    {
+        if (arp_cache.entries[i].state == ARP_STATE_VALID &&
+            arp_cache.entries[i].ip_addr == ip)
+        {
+            memcpy(mac_out, arp_cache.entries[i].mac_addr, MAC_ADDR_LEN);
+            arp_cache.hits++;
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+void arp_cache_update(uint32_t ip, const uint8_t *mac, uint8_t state)
+{
+    int empty_idx = -1;
+    int oldest_idx = 0;
+    uint16_t oldest_age = 0;
+
+    for (int i = 0; i < ARP_CACHE_SIZE; i++)
+    {
+        if (arp_cache.entries[i].ip_addr == ip)
+        {
+            arp_cache.entries[i].state = state;
+            memcpy(arp_cache.entries[i].mac_addr, mac, MAC_ADDR_LEN);
+            arp_cache.entries[i].age_seconds = 0;
+            return;
+        }
+
+        if (arp_cache.entries[i].state == ARP_STATE_INVALID && empty_idx < 0)
+            empty_idx = i;
+
+        if (arp_cache.entries[i].age_seconds > oldest_age)
+        {
+            oldest_age = arp_cache.entries[i].age_seconds;
+            oldest_idx = i;
+        }
+    }
+
+    int idx = (empty_idx >= 0) ? empty_idx : oldest_idx;
+
+    arp_cache.entries[idx].ip_addr = ip;
+    memcpy(arp_cache.entries[idx].mac_addr, mac, MAC_ADDR_LEN);
+    arp_cache.entries[idx].state = state;
+    arp_cache.entries[idx].age_seconds = 0;
+}
+
+int arp_cache_start_resolve(uint32_t ip)
+{
+    uint8_t zero_mac[MAC_ADDR_LEN] = {0};
+    arp_cache_update(ip, zero_mac, ARP_STATE_RESOLVING);
+
+    for (int i = 0; i < ARP_CACHE_SIZE; i++)
+    {
+        if (arp_cache.entries[i].ip_addr == ip)
+            return i;
+    }
+    return -1;
+}
+
+void arp_cache_age(void)
+{
+    for (int i = 0; i < ARP_CACHE_SIZE; i++)
+    {
+        if (arp_cache.entries[i].state == ARP_STATE_INVALID)
+            continue;
+
+        arp_cache.entries[i].age_seconds++;
+
+        if (arp_cache.entries[i].state == ARP_STATE_VALID &&
+            arp_cache.entries[i].age_seconds >= ARP_TIMEOUT_SEC)
+        {
+            arp_cache.entries[i].state = ARP_STATE_INVALID;
+        }
+        else if (arp_cache.entries[i].state == ARP_STATE_RESOLVING &&
+                 arp_cache.entries[i].age_seconds >= 3)
+        {
+            arp_cache.entries[i].state = ARP_STATE_INVALID;
+        }
+    }
+}
+
+void arp_cache_print(void)
+{
+#if !defined(NO_PRINTF)
+    extern int printf(const char *fmt, ...);
+    printf("--- ARP Cache (lookups=%lu, hits=%lu, hitrate=%lu%%) ---\n",
+           (unsigned long)arp_cache.lookups,
+           (unsigned long)arp_cache.hits,
+           arp_cache.lookups > 0
+               ? (unsigned long)(arp_cache.hits * 100 / arp_cache.lookups)
+               : 0);
+    for (int i = 0; i < ARP_CACHE_SIZE; i++)
+    {
+        arp_entry_t *e = &arp_cache.entries[i];
+        const char *s;
+        switch (e->state) {
+            case ARP_STATE_INVALID:   s = "INV"; break;
+            case ARP_STATE_RESOLVING: s = "RSV"; break;
+            case ARP_STATE_VALID:     s = "VAL"; break;
+            default:                  s = "???"; break;
+        }
+        if (e->state != ARP_STATE_INVALID)
+        {
+            uint8_t *ipb = (uint8_t *)&e->ip_addr;
+            printf("  [%d] %d.%d.%d.%d -> %02X:%02X:%02X:%02X:%02X:%02X [%s] age=%u\n",
+                   i, ipb[0], ipb[1], ipb[2], ipb[3],
+                   e->mac_addr[0], e->mac_addr[1], e->mac_addr[2],
+                   e->mac_addr[3], e->mac_addr[4], e->mac_addr[5],
+                   s, e->age_seconds);
+        }
+    }
+#endif
+}
+
+#if defined(TEST_ARP_CACHE)
+#include <stdio.h>
+
+int main(void)
+{
+    arp_cache_init();
+
+    uint8_t mac[6];
+    uint8_t mac1[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01};
+    uint8_t mac2[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02};
+    uint32_t ip1 = 0xC0A80101;
+    uint32_t ip2 = 0xC0A80102;
+
+    arp_cache_update(ip1, mac1, ARP_STATE_VALID);
+    arp_cache_update(ip2, mac2, ARP_STATE_VALID);
+
+    int found = arp_cache_lookup(ip1, mac);
+    printf("Lookup 192.168.1.1: %s\n", found ? "FOUND" : "NOT FOUND");
+
+    found = arp_cache_lookup(0xC0A80103, mac);
+    printf("Lookup 192.168.1.3: %s\n", found ? "FOUND" : "NOT FOUND");
+
+    arp_cache_print();
+
+    /* 模拟老化 */
+    printf("\n--- After 301 seconds ---\n");
+    for (int i = 0; i < 301; i++)
+        arp_cache_age();
+    found = arp_cache_lookup(ip1, mac);
+    printf("Lookup after aging: %s\n", found ? "FOUND" : "NOT FOUND");
+
+    return 0;
+}
+#endif /* TEST_ARP_CACHE */
+```
+
+**用法示例**：
+```c
+/* 发送数据前的 ARP 处理流程 */
+int eth_send_udp(uint32_t dst_ip, const uint8_t *data, uint16_t len)
+{
+    uint8_t dst_mac[MAC_ADDR_LEN];
+
+    if (arp_cache_lookup(dst_ip, dst_mac))
+    {
+        return build_and_send_eth_frame(dst_mac, 0x0800, data, len);
+    }
+
+    arp_cache_start_resolve(dst_ip);
+
+    uint8_t broadcast_mac[MAC_ADDR_LEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+    send_arp_request(broadcast_mac, dst_ip);
+    queue_pending_packet(dst_ip, data, len);
+    return 0;
+}
+
+void on_arp_reply(uint32_t sender_ip, const uint8_t *sender_mac)
+{
+    arp_cache_update(sender_ip, sender_mac, ARP_STATE_VALID);
+    dequeue_and_send_pending(sender_ip);
+}
+```
+
+---
+
+### D.6 Packet Buffer Management
+
+**功能**：轻量级数据包缓冲区管理，类似 lwIP 的 pbuf 机制，适用于资源受限的 MCU。
+
+```c
+/**
+ * pbuf.h - 轻量级数据包缓冲区管理
+ *
+ * 设计思路：
+ * - 静态内存池分配，避免动态内存碎片
+ * - 支持单 buffer 和链式 buffer
+ * - 减少数据拷贝（通过指针操作）
+ *
+ * 编译测试：
+ *   gcc -DTEST_PBUF -o test_pbuf pbuf.c && ./test_pbuf
+ */
+
+#include <stdint.h>
+#include <string.h>
+#include <stddef.h>
+
+/* ---------- 配置 ---------- */
+#define PBUF_POOL_SIZE      8
+#define PBUF_POOL_BUF_SIZE  1536
+
+/* ---------- 数据结构 ---------- */
+
+typedef struct pbuf {
+    struct pbuf *next;
+    uint8_t      *payload;
+    uint16_t     len;
+    uint16_t     tot_len;
+    uint16_t     ref;
+    uint8_t      in_use;
+    uint8_t      data[PBUF_POOL_BUF_SIZE];
+} pbuf_t;
+
+static pbuf_t pbuf_pool[PBUF_POOL_SIZE];
+
+void pbuf_init(void)
+{
+    memset(pbuf_pool, 0, sizeof(pbuf_pool));
+}
+
+pbuf_t *pbuf_alloc(uint16_t size)
+{
+    if (size > PBUF_POOL_BUF_SIZE || size == 0)
+        return NULL;
+
+    for (int i = 0; i < PBUF_POOL_SIZE; i++)
+    {
+        if (!pbuf_pool[i].in_use)
+        {
+            pbuf_t *p = &pbuf_pool[i];
+            memset(p, 0, sizeof(pbuf_t));
+            p->in_use  = 1;
+            p->ref     = 1;
+            p->payload = p->data;
+            p->len     = size;
+            p->tot_len = size;
+            p->next    = NULL;
+            return p;
+        }
+    }
+    return NULL;
+}
+
+void pbuf_free(pbuf_t *p)
+{
+    if (p == NULL) return;
+
+    if (p->ref > 1) { p->ref--; return; }
+
+    pbuf_t *cur = p;
+    while (cur != NULL)
+    {
+        pbuf_t *nxt = cur->next;
+        cur->in_use = 0;
+        cur->ref    = 0;
+        cur->next   = NULL;
+        cur = nxt;
+    }
+}
+
+void pbuf_ref(pbuf_t *p)
+{
+    if (p) p->ref++;
+}
+
+uint16_t pbuf_copy(pbuf_t *dst, const uint8_t *src, uint16_t len)
+{
+    uint16_t written = 0;
+    while (dst && len)
+    {
+        uint16_t c = (len < dst->len) ? len : dst->len;
+        memcpy(dst->payload, src + written, c);
+        written += c;
+        len -= c;
+        dst = dst->next;
+    }
+    return written;
+}
+
+uint16_t pbuf_copy_to_buf(uint8_t *dst, const pbuf_t *src, uint16_t len)
+{
+    uint16_t copied = 0;
+    while (src && len)
+    {
+        uint16_t c = (len < src->len) ? len : src->len;
+        memcpy(dst + copied, src->payload, c);
+        copied += c;
+        len -= c;
+        src = src->next;
+    }
+    return copied;
+}
+
+int pbuf_header(pbuf_t *p, int16_t size)
+{
+    if (p == NULL) return -1;
+
+    if (size < 0)
+    {
+        int16_t shift = (int16_t)(-size);
+        if ((uint8_t *)(p->payload) - shift < p->data)
+            return -1;
+        p->payload -= shift;
+        p->len     += (uint16_t)shift;
+        p->tot_len += (uint16_t)shift;
+    }
+    else
+    {
+        if ((uint16_t)size > p->len) return -1;
+        p->payload += size;
+        p->len     -= (uint16_t)size;
+        p->tot_len -= (uint16_t)size;
+    }
+    return 0;
+}
+
+#if defined(TEST_PBUF)
+#include <stdio.h>
+
+int main(void)
+{
+    pbuf_init();
+
+    pbuf_t *p = pbuf_alloc(64);
+    if (!p) { printf("alloc failed\n"); return 1; }
+    printf("Allocated: len=%u\n", p->len);
+
+    const char *test = "Hello Ethernet!";
+    memcpy(p->payload, test, strlen(test) + 1);
+
+    pbuf_t *p2 = pbuf_alloc(100);
+    pbuf_header(p2, -14);
+    pbuf_header(p2, -20);
+    printf("After header reserve: len=%u, tot_len=%u\n",
+           p2->len, p2->tot_len);
+
+    pbuf_t *c1 = pbuf_alloc(10);
+    pbuf_t *c2 = pbuf_alloc(20);
+    memcpy(c1->payload, "HEAD", 4);
+    memcpy(c2->payload, "TAIL", 4);
+    c1->next = c2;
+    c1->tot_len = c1->len + c2->len;
+
+    uint8_t linear[64];
+    uint16_t copied = pbuf_copy_to_buf(linear, c1, sizeof(linear));
+    linear[copied] = '\0';
+    printf("Chained: %s (expect HEADTAIL)\n", linear);
+
+    pbuf_free(p);
+    pbuf_free(p2);
+    pbuf_free(c1);
+
+    int used = 0;
+    for (int i = 0; i < PBUF_POOL_SIZE; i++)
+        if (pbuf_pool[i].in_use) used++;
+    printf("Pool: %d/%d in use\n", used, PBUF_POOL_SIZE);
+
+    return 0;
+}
+#endif /* TEST_PBUF */
+```
+
+**用法示例**：
+```c
+/* 协议栈分层处理流程 */
+pbuf_t *build_udp_packet(uint32_t dst_ip, uint16_t dst_port,
+                         const uint8_t *data, uint16_t len)
+{
+    uint16_t total = 14 + 20 + 8 + len;  /* Eth + IP + UDP + payload */
+    pbuf_t *p = pbuf_alloc(total);
+    if (p == NULL) return NULL;
+
+    memcpy(p->payload + 14 + 20 + 8, data, len);
+
+    /* 填充 UDP 头部 */
+    uint16_t udp_len = 8 + len;
+    p->payload[14+20+0] = (uint8_t)((dst_port >> 8) & 0xFF);
+    p->payload[14+20+1] = (uint8_t)( dst_port       & 0xFF);
+    p->payload[14+20+4] = (uint8_t)((udp_len  >> 8) & 0xFF);
+    p->payload[14+20+5] = (uint8_t)( udp_len        & 0xFF);
+
+    /* 填充 IP 头部 (调用 D.3 的 build_ip_header) */
+    build_ip_header(&p->payload[14], 0xC0A80101, dst_ip, 17, 20 + 8 + len);
+
+    /* 填充以太网头部 ... */
+    return p;
+}
+```
+
+---
+
+### D.7 Simple Statistics
+
+**功能**：网络接口的统计计数器，用于调试和性能监控。
+
+```c
+/**
+ * eth_stats.h - 以太网接口统计计数器
+ *
+ * 支持多端口（用于交换芯片场景）。
+ *
+ * 编译测试：
+ *   gcc -DTEST_STATS -o test_stats eth_stats.c && ./test_stats
+ */
+
+#include <stdint.h>
+#include <string.h>
+#include <stdbool.h>
+
+/* ---------- 配置 ---------- */
+#define ETH_MAX_PORTS    4
+
+/* ---------- 错误标志 ---------- */
+#define ERR_CRC          0x00000001
+#define ERR_ALIGNMENT    0x00000002
+#define ERR_COLLISION    0x00000004
+#define ERR_OVERSIZE     0x00000008
+#define ERR_UNDERSIZE    0x00000010
+#define ERR_RUNT         0x00000020
+#define ERR_JABBER       0x00000040
+#define ERR_FRAGMENT     0x00000080
+#define ERR_LATE_COLL    0x00000100
+#define ERR_EXCESS_COLL  0x00000200
+#define ERR_FIFO_UNDER   0x00000400
+#define ERR_FIFO_OVER    0x00000800
+#define ERR_DROPPED      0x00001000
+
+/* ---------- 统计数据结构 ---------- */
+
+typedef struct {
+    uint32_t rx_packets;
+    uint32_t tx_packets;
+    uint32_t rx_bytes;
+    uint32_t tx_bytes;
+    uint32_t rx_errors;
+    uint32_t tx_errors;
+    uint32_t rx_dropped;
+    uint32_t tx_dropped;
+    uint32_t crc_errors;
+    uint32_t alignment_errors;
+    uint32_t collisions;
+    uint32_t late_collisions;
+    uint32_t excessive_collisions;
+    uint32_t oversize_errors;
+    uint32_t undersize_errors;
+    uint32_t fragments;
+    uint32_t jabber_errors;
+    uint32_t fifo_overruns;
+    uint32_t fifo_underruns;
+    uint32_t multicast_rx;
+    uint32_t broadcast_rx;
+    uint32_t multicast_tx;
+    uint32_t broadcast_tx;
+    uint32_t rx_bps;
+    uint32_t tx_bps;
+    uint32_t rx_pps;
+    uint32_t tx_pps;
+    uint32_t last_rx_bytes;
+    uint32_t last_tx_bytes;
+    uint32_t last_rx_packets;
+    uint32_t last_tx_packets;
+} eth_port_stats_t;
+
+static eth_port_stats_t eth_stats[ETH_MAX_PORTS];
+
+void eth_stats_init(void)
+{
+    memset(eth_stats, 0, sizeof(eth_stats));
+}
+
+void eth_stats_rx_ok(uint8_t port, uint32_t byte_count,
+                     bool is_multicast, bool is_broadcast)
+{
+    if (port >= ETH_MAX_PORTS) return;
+    eth_port_stats_t *s = &eth_stats[port];
+    s->rx_packets++;
+    s->rx_bytes += byte_count;
+    if (is_multicast)  s->multicast_rx++;
+    if (is_broadcast)  s->broadcast_rx++;
+}
+
+void eth_stats_tx_ok(uint8_t port, uint32_t byte_count,
+                     bool is_multicast, bool is_broadcast)
+{
+    if (port >= ETH_MAX_PORTS) return;
+    eth_port_stats_t *s = &eth_stats[port];
+    s->tx_packets++;
+    s->tx_bytes += byte_count;
+    if (is_multicast) s->multicast_tx++;
+    if (is_broadcast) s->broadcast_tx++;
+}
+
+void eth_stats_rx_error(uint8_t port, uint32_t err_flags)
+{
+    if (port >= ETH_MAX_PORTS) return;
+    eth_port_stats_t *s = &eth_stats[port];
+    s->rx_errors++;
+    if (err_flags & ERR_CRC)       s->crc_errors++;
+    if (err_flags & ERR_ALIGNMENT) s->alignment_errors++;
+    if (err_flags & ERR_COLLISION) s->collisions++;
+    if (err_flags & ERR_OVERSIZE)  s->oversize_errors++;
+    if (err_flags & ERR_UNDERSIZE) s->undersize_errors++;
+    if (err_flags & ERR_FRAGMENT)  s->fragments++;
+    if (err_flags & ERR_JABBER)    s->jabber_errors++;
+    if (err_flags & ERR_FIFO_OVER) s->fifo_overruns++;
+    if (err_flags & ERR_FIFO_UNDER)s->fifo_underruns++;
+    if (err_flags & ERR_DROPPED)   s->rx_dropped++;
+}
+
+void eth_stats_update_rates(void)
+{
+    for (int port = 0; port < ETH_MAX_PORTS; port++)
+    {
+        eth_port_stats_t *s = &eth_stats[port];
+        s->rx_bps = (s->rx_bytes - s->last_rx_bytes) * 8;
+        s->tx_bps = (s->tx_bytes - s->last_tx_bytes) * 8;
+        s->rx_pps = (s->rx_packets - s->last_rx_packets);
+        s->tx_pps = (s->tx_packets - s->last_tx_packets);
+        s->last_rx_bytes   = s->rx_bytes;
+        s->last_tx_bytes   = s->tx_bytes;
+        s->last_rx_packets = s->rx_packets;
+        s->last_tx_packets = s->tx_packets;
+    }
+}
+
+void eth_stats_print(uint8_t port)
+{
+#if !defined(NO_PRINTF)
+    extern int printf(const char *fmt, ...);
+    if (port >= ETH_MAX_PORTS) return;
+    eth_port_stats_t *s = &eth_stats[port];
+
+    printf("==== Port %u Stats ====\n", port);
+    printf("  RX: %lu pkts, %lu bytes\n",
+           (unsigned long)s->rx_packets, (unsigned long)s->rx_bytes);
+    printf("  TX: %lu pkts, %lu bytes\n",
+           (unsigned long)s->tx_packets, (unsigned long)s->tx_bytes);
+    printf("  Rates: RX %lu bps/%lu pps, TX %lu bps/%lu pps\n",
+           (unsigned long)s->rx_bps, (unsigned long)s->rx_pps,
+           (unsigned long)s->tx_bps, (unsigned long)s->tx_pps);
+    printf("  MCast RX: %lu, BCast RX: %lu\n",
+           (unsigned long)s->multicast_rx, (unsigned long)s->broadcast_rx);
+    printf("  Errors: CRC=%lu, Align=%lu, Coll=%lu\n",
+           (unsigned long)s->crc_errors, (unsigned long)s->alignment_errors,
+           (unsigned long)s->collisions);
+#endif
+}
+
+void eth_stats_print_summary(void)
+{
+#if !defined(NO_PRINTF)
+    extern int printf(const char *fmt, ...);
+    printf("Port | RX Pkts  | TX Pkts  | RX Err | TX Err | RX bps\n");
+    printf("-----+----------+----------+--------+--------+----------\n");
+    for (int port = 0; port < ETH_MAX_PORTS; port++)
+    {
+        eth_port_stats_t *s = &eth_stats[port];
+        printf("  %u  | %8lu | %8lu | %6lu | %6lu | %8lu\n",
+               port,
+               (unsigned long)s->rx_packets,
+               (unsigned long)s->tx_packets,
+               (unsigned long)s->rx_errors,
+               (unsigned long)s->tx_errors,
+               (unsigned long)s->rx_bps);
+    }
+#endif
+}
+
+void eth_stats_clear(uint8_t port)
+{
+    if (port >= ETH_MAX_PORTS) return;
+    memset(&eth_stats[port], 0, sizeof(eth_port_stats_t));
+}
+
+void eth_stats_clear_all(void)
+{
+    memset(eth_stats, 0, sizeof(eth_stats));
+}
+
+#if defined(TEST_STATS)
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+int main(void)
+{
+    srand((unsigned)time(NULL));
+    eth_stats_init();
+
+    for (int sec = 0; sec < 5; sec++)
+    {
+        int rx = rand() % 1000;
+        int tx = rand() % 800;
+        for (int i = 0; i < rx; i++)
+        {
+            eth_stats_rx_ok(0, 64 + (rand() % 1400),
+                           (rand() % 3 == 0), (rand() % 10 == 0));
+            if (rand() % 100 == 0)
+                eth_stats_rx_error(0, ERR_CRC);
+        }
+        for (int i = 0; i < tx; i++)
+            eth_stats_tx_ok(0, 64 + (rand() % 1400),
+                           (rand() % 3 == 0), (rand() % 10 == 0));
+        eth_stats_update_rates();
+    }
+
+    eth_stats_print(0);
+    eth_stats_print_summary();
+    return 0;
+}
+#endif /* TEST_STATS */
+```
+
+**用法示例**：
+```c
+/* MAC 接收中断中集成统计 */
+void MAC_IRQHandler(void)
+{
+    uint8_t rx_data[1536];
+    uint16_t rx_len;
+
+    if (MAC_read_frame(rx_data, &rx_len))
+    {
+        eth_stats_rx_ok(0, rx_len,
+                       mac_is_multicast(rx_data),
+                       mac_is_broadcast(rx_data));
+        process_eth_frame(rx_data, rx_len);
+    }
+    else
+    {
+        eth_stats_rx_error(0, ERR_CRC);
+    }
+}
+```
+
+---
+
+### D.8 Timer Utilities
+
+**功能**：基于 SysTick 的毫秒计时、微秒延时、超时检测和周期性任务调度器。
+
+```c
+/**
+ * timer_utils.h - MCU 定时器工具函数
+ *
+ * 基于 ARM Cortex-M SysTick 实现。
+ * 其他 MCU 平台替换 get_ms_tick() 为同级接口即可。
+ *
+ * 编译测试（PC 模拟）：
+ *   gcc -DTEST_TIMER -o test_timer timer_utils.c && ./test_timer
+ */
+
+#include <stdint.h>
+#include <stdbool.h>
+
+/* ---------- 系统滴答 ---------- */
+
+static volatile uint32_t system_ms_ticks = 0;
+
+/**
+ * SysTick 中断处理函数（每 1ms 调用一次）
+ * 初始化：SysTick_Config(SystemCoreClock / 1000);
+ */
+void SysTick_Handler(void)
+{
+    system_ms_ticks++;
+}
+
+/**
+ * 获取当前毫秒值
+ * 溢出周期：约 49.7 天（32 位计数器）
+ */
+uint32_t get_ms_tick(void)
+{
+    uint32_t tick;
+    __disable_irq();
+    tick = system_ms_ticks;
+    __enable_irq();
+    return tick;
+}
+
+/**
+ * 阻塞延时（毫秒）
+ */
+void delay_ms(uint32_t ms)
+{
+    uint32_t start = get_ms_tick();
+    while ((get_ms_tick() - start) < ms) { }
+}
+
+/**
+ * 微秒延时（忙等待，用于 MDIO 等精确时序）
+ * 需根据 MCU 主频调整 MICROSECOND_LOOPS
+ */
+#define MICROSECOND_LOOPS  72  /* 72MHz 约 72 周期/us */
+
+void delay_us(uint32_t us)
+{
+    for (uint32_t i = 0; i < us; i++)
+    {
+        for (volatile uint32_t j = 0; j < MICROSECOND_LOOPS; j++) { }
+    }
+}
+
+/* ---------- 超时检测 ---------- */
+
+typedef struct {
+    uint32_t start_tick;
+    uint32_t timeout_ms;
+    bool     running;
+} timeout_t;
+
+void timeout_start(timeout_t *t, uint32_t timeout_ms)
+{
+    t->start_tick = get_ms_tick();
+    t->timeout_ms = timeout_ms;
+    t->running    = true;
+}
+
+bool timeout_expired(timeout_t *t)
+{
+    if (!t->running) return false;
+    if ((get_ms_tick() - t->start_tick) >= t->timeout_ms)
+    {
+        t->running = false;
+        return true;
+    }
+    return false;
+}
+
+void timeout_stop(timeout_t *t)
+{
+    t->running = false;
+}
+
+uint32_t timeout_remaining(timeout_t *t)
+{
+    if (!t->running) return 0;
+    uint32_t elapsed = get_ms_tick() - t->start_tick;
+    if (elapsed >= t->timeout_ms) return 0;
+    return t->timeout_ms - elapsed;
+}
+
+void timeout_reset(timeout_t *t)
+{
+    t->start_tick = get_ms_tick();
+    t->running    = true;
+}
+
+/* ---------- 周期性任务调度器 ---------- */
+
+#define SCHEDULER_MAX_TASKS   8
+
+typedef enum {
+    TASK_READY,
+    TASK_PAUSED,
+    TASK_STOPPED
+} task_state_t;
+
+typedef struct {
+    void     (*func)(void);
+    uint32_t  interval_ms;
+    uint32_t  last_run;
+    task_state_t state;
+    const char *name;
+} task_t;
+
+typedef struct {
+    task_t tasks[SCHEDULER_MAX_TASKS];
+    int    task_count;
+} scheduler_t;
+
+static scheduler_t scheduler;
+
+void scheduler_init(void)
+{
+    scheduler.task_count = 0;
+}
+
+int scheduler_add(void (*func)(void), uint32_t interval_ms, const char *name)
+{
+    if (scheduler.task_count >= SCHEDULER_MAX_TASKS) return -1;
+    task_t *t = &scheduler.tasks[scheduler.task_count++];
+    t->func        = func;
+    t->interval_ms = interval_ms;
+    t->last_run    = get_ms_tick();
+    t->state       = TASK_READY;
+    t->name        = name;
+    return scheduler.task_count - 1;
+}
+
+void scheduler_pause(int idx)
+{
+    if (idx >= 0 && idx < scheduler.task_count)
+        scheduler.tasks[idx].state = TASK_PAUSED;
+}
+
+void scheduler_resume(int idx)
+{
+    if (idx >= 0 && idx < scheduler.task_count)
+    {
+        scheduler.tasks[idx].state = TASK_READY;
+        scheduler.tasks[idx].last_run = get_ms_tick();
+    }
+}
+
+void scheduler_run(void)
+{
+    uint32_t now = get_ms_tick();
+    for (int i = 0; i < scheduler.task_count; i++)
+    {
+        task_t *t = &scheduler.tasks[i];
+        if (t->state != TASK_READY) continue;
+        if ((now - t->last_run) >= t->interval_ms)
+        {
+            t->last_run = now;
+            t->func();
+        }
+    }
+}
+
+#if defined(TEST_TIMER)
+#include <stdio.h>
+
+/* PC 测试：模拟 get_ms_tick */
+static uint32_t simulated_tick = 0;
+uint32_t get_ms_tick(void) { return simulated_tick; }
+void __disable_irq(void) {}
+void __enable_irq(void)  {}
+
+void blink_led(void) { printf("[%lu] Blink LED\n", (unsigned long)simulated_tick); }
+void arp_age(void)   { printf("[%lu] ARP age\n", (unsigned long)simulated_tick); }
+
+int main(void)
+{
+    printf("=== Timeout Test ===\n");
+    timeout_t t;
+    timeout_start(&t, 50);
+    while (!timeout_expired(&t))
+    {
+        simulated_tick += 10;
+        printf("  remaining=%lu\n",
+               (unsigned long)timeout_remaining(&t));
+    }
+    printf("  Expired at tick=%lu!\n", (unsigned long)simulated_tick);
+
+    printf("\n=== Scheduler Test ===\n");
+    simulated_tick = 0;
+    scheduler_init();
+    scheduler_add(blink_led, 500, "LED");
+    scheduler_add(arp_age,   1000, "ARP");
+
+    for (int s = 0; s < 3; s++)
+    {
+        for (int ms = 0; ms < 1000; ms += 10)
+        {
+            simulated_tick += 10;
+            scheduler_run();
+        }
+    }
+
+    printf("\n=== Done ===\n");
+    return 0;
+}
+#endif /* TEST_TIMER */
+```
+
+**用法示例**：
+```c
+/* MCU 主程序典型结构 */
+int main(void)
+{
+    SystemInit();
+    SysTick_Config(SystemCoreClock / 1000);
+
+    ethernet_init();
+    arp_cache_init();
+    scheduler_init();
+
+    scheduler_add(led_toggle,       500,  "LED");
+    scheduler_add(arp_cache_age,    1000, "ARP");
+    scheduler_add(eth_stats_update, 1000, "Stats");
+    scheduler_add(check_phy_link,   2000, "PHY");
+
+    while (1)
+    {
+        if (MAC_has_frame())
+        {
+            uint8_t buf[1536];
+            uint16_t len = MAC_read_frame(buf);
+            process_ethernet_frame(buf, len);
+        }
+        scheduler_run();
+    }
+}
+
+/* 超时示例：等待 ARP 应答 */
+void wait_for_arp(uint32_t target_ip)
+{
+    uint8_t mac[6];
+    timeout_t t;
+    timeout_start(&t, 3000);
+
+    while (!timeout_expired(&t))
+    {
+        if (arp_cache_lookup(target_ip, mac))
+        {
+            printf("ARP resolved!\n");
+            return;
+        }
+        process_network_events();
+    }
+    printf("ARP timeout!\n");
+}
+```
+
+---
+
+## 参考资源

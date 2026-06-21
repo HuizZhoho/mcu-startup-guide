@@ -4010,6 +4010,1297 @@ void phy_write(uint8_t phy_addr, uint8_t reg, uint16_t data) {
 
 ---
 
+## Appendix D: Real-World PHY Debugging Case Studies
+
+> 本章收录了 7 个真实项目中遇到的 PHY 硬件/驱动故障案例。每个案例都按照"症状 -- 现象 -- 根因分析 -- 修复 -- 预防"的完整流程展开。目标是用实际踩过的坑让初学者少走弯路。
+
+---
+
+### Case 1: Link LED 亮但 Ping 不通
+
+#### 症状
+
+RJ45 插座上的绿色 Link LED 正常点亮（看起来链路已建立），但 `ping 192.168.1.1` 全部超时，`arp -a` 看不到对端 MAC 地址。用串口调试看到 PHY 的 BMSR 寄存器 bit2=1（Link UP）。
+
+#### 看到的现场
+
+串口输出：
+
+```
+--- PHY Register Dump (addr=0x00) ---
+Reg 0x00 (BMCR):   0x1140   [0001 0001 0100 0000]
+Reg 0x01 (BMSR):   0x782D   [0111 1000 0010 1101]
+  Link Status: UP (bit2=1)
+  Auto-Neg Done: YES (bit5=1)
+Reg 0x04 (ANAR):   0x01E1   [0000 0001 1110 0001]
+Reg 0x05 (ANLPAR): 0x01E1   [0000 0001 1110 0001]
+```
+
+BMSR 显示链路已建立，协商已完成，双方能力一致（0x01E1 表示 10/100M FD/HD 全部支持）。看起来一切正常，但就是 Ping 不通。
+
+更令人困惑的是，Wireshark 在 PC 端抓包**能看到**开发板发出的 ARP 请求，但 PC 的 ARP 响应开发板收不到。
+
+#### 根因分析
+
+检查 MAC 侧的配置。在 STM32 中，MAC 控制器需要根据 PHY 的协商结果独立配置速度/双工。如果 MAC 和 PHY 的速度/双工配置不一致，数据帧会损坏。
+
+关键寄存器对比：
+
+```c
+// 读取 PHY 的协商结果
+uint16_t scsr = mdio_read(0x00, 0x1F);  // LAN8720A SCSR
+// scsr = 0x5000
+// bit14=1 → 100M
+// bit13=0 → 半双工 !!! 问题在这里 !!!
+// bit12=1 → 协商完成
+
+// 检查 MAC 配置 (STM32 ETH_MACCR)
+uint32_t maccr = ETH->MACCR;
+// maccr = 0x00000004 (!!!)
+// bit14=0 → 未设 DM (全双工)
+// bit13=0 → FES=0 (10M 模式)
+// MAC 配置为 10M 半双工，但 PHY 协商结果是 100M 半双工！
+```
+
+**问题所在**：PHY 通过 ANEG 协商到 100M 半双工，但 MAC 控制器配置代码中有一个 bug：
+
+```c
+// ===== 错误的 MAC 配置代码 =====
+void mac_config_speed_duplex(uint8_t speed_100m, uint8_t full_duplex) {
+    uint32_t reg = ETH->MACCR;
+
+    if (speed_100m) {
+        reg |= ETH_MACCR_FES;       // 100M
+    } else {
+        reg &= ~ETH_MACCR_FES;      // 10M
+    }
+
+    if (full_duplex) {
+        reg |= ETH_MACCR_DM;        // 全双工
+    }
+
+    ETH->MACCR = reg;
+    // 错误: 没有清除 DM 位就设置!
+    // 如果 full_duplex=0, 本应清除 DM 位, 但代码没有清除!
+}
+```
+
+正确做法：
+
+```c
+// ===== 正确的 MAC 配置代码 =====
+void mac_config_speed_duplex(uint8_t speed_100m, uint8_t full_duplex) {
+    uint32_t reg = ETH->MACCR;
+
+    // 清除速度和双工位 (先清零再设置)
+    reg &= ~(ETH_MACCR_FES | ETH_MACCR_DM);
+
+    if (speed_100m) {
+        reg |= ETH_MACCR_FES;       // 100M
+    }
+    // else: 10M (FES=0, 默认)
+
+    if (full_duplex) {
+        reg |= ETH_MACCR_DM;        // 全双工
+    }
+    // else: 半双工 (DM=0)
+
+    ETH->MACCR = reg;
+}
+```
+
+修复后，百兆全双工模式下的 MACCR 正确值应为 `0x00008014`（DM=1, FES=1）。
+
+#### 验证 MAC 与 PHY 是否匹配的方法
+
+手动对比以下配置：
+
+```
+MAC 侧:                              PHY 侧:
+ETH->MACCR.DM (bit14)  = 1  ←→  SCSR.bit13 (Full Duplex) = 1
+ETH->MACCR.FES (bit13) = 1  ←→  SCSR.bit14 (100M)       = 1
+```
+
+如果有一侧不匹配，就是问题。
+
+#### 预防
+
+1. **MAC 配置使用"先清零再设置"模式**，不要依赖寄存器的默认值。
+2. **在驱动初始化时，增加一致性检查**：读取 PHY 协商结果后，打印 MAC 和 PHY 两边的配置做对比。
+3. **使用环回测试验证**：先做 PHY 环回（BMCR bit14=1），确认 MAC→PHY→MAC 通路正常。
+
+```c
+// 一致性检查函数
+int phy_mac_consistency_check(PHY_Device *dev) {
+    uint16_t scsr = mdio_read(dev->phy_addr, 0x1F);
+    uint32_t maccr = ETH->MACCR;
+
+    int phy_100m  = (scsr >> 14) & 1;
+    int phy_fd    = (scsr >> 13) & 1;
+    int mac_100m  = (maccr >> 13) & 1;  // FES
+    int mac_fd    = (maccr >> 14) & 1;  // DM
+
+    printf("PHY: %s %s\n", phy_100m ? "100M" : "10M", phy_fd ? "FD" : "HD");
+    printf("MAC: %s %s\n", mac_100m ? "100M" : "10M", mac_fd ? "FD" : "HD");
+
+    if (phy_100m != mac_100m || phy_fd != mac_fd) {
+        printf("错误: PHY 和 MAC 速度/双工不匹配!\n");
+        return -1;
+    }
+    return 0;
+}
+```
+
+---
+
+### Case 2: 间歇性 Link 断开
+
+#### 症状
+
+设备运行中，每隔几秒到几十秒 Link 灯就会灭一下再亮。Ping 对端时出现间歇性 `Request timed out`，不稳定。
+
+#### 看到的现场
+
+串口监视器输出（每秒轮询一次）：
+
+```
+[T=0s]  Link UP   [BMSR=0x782D]
+[T=1s]  Link UP   [BMSR=0x782D]
+[T=2s]  Link UP   [BMSR=0x7829]   ← bit2=0! Link 刚掉又恢复
+[T=3s]  Link UP   [BMSR=0x782D]
+...
+[T=17s] Link UP   [BMSR=0x7829]   ← 又掉一次
+[T=18s] Link UP   [BMSR=0x782D]
+```
+
+注意 BMSR 值的变化：`0x782D`（Link UP） vs `0x7829`（Link 刚恢复，但 Latching 暴露了曾经断过）。因为 BMSR bit2 是 Latching Low，0x7829 表示这个寄存器的 bit2 在读取之前曾经为 0（链路断过）。
+
+用示波器测量 PHY 的电源引脚（3.3V 和 1.2V 核心电压）：
+
+```
+示波器截图描述：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CH1: PHY 3.3V 电源  (500mV/div, AC耦合)
+CH2: Link LED 信号  (2V/div)
+
+时间轴: 200ms/div
+
+CH1 波形: 基准 3.3V 上叠加了约 200mVpp 的纹波
+         在 Link 断开瞬间 (CH2 下降沿)，CH1 上
+         可以看到一个约 400mV 的电压跌落 (droop)
+         
+         纹波频率约 100Hz (50Hz 全波整流的残留)
+         在电压跌落时，3.3V 最低到约 2.85V
+         
+CH2 波形: 正常时高电平 (3.3V)
+         断开时变为高阻 (被 LED 拉低)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+#### 根因分析
+
+PHY 对电源噪声非常敏感。LAN8720A 的 3.3V 电源纹波要求不超过 ±50mV。现场实测纹波达 200mVpp，远超规格。
+
+进一步检查 PCB，发现 PHY 的电源去耦电容配置如下：
+
+```
+问题 PCB 的 PHY 电源布局：
+  ┌─────────────────────────────────────┐
+  │  3.3V 电源                            │
+  │    │                                   │
+  │    └─── 10μF 电解电容 (距离 PHY 5cm)    │
+  │    └─── 0.1μF 瓷片电容 (距离 PHY 3cm)   │
+  │         ↓ 电容离 PHY 太远，引线电感大    │
+  │    PHY_VDD                              │
+  └─────────────────────────────────────┘
+```
+
+去耦电容离 PHY 引脚太远（超过 1cm），导致引线电感过大，高频噪声无法有效滤波。当 PHY 发射数据时瞬间电流增大，电源电压跌落，PHY 内部电路复位或 PLL 失锁，导致 Link 断开。
+
+#### 修复
+
+在 PHY 电源引脚旁边紧贴放置合适的去耦电容：
+
+```
+修复后的 PCB 电源布局：
+  ┌─────────────────────────────────────┐
+  │  3.3V 电源                            │
+  │    │                                   │
+  │    ├─── 100nF (0402) ← 紧贴 PHY 引脚   │
+  │    ├─── 10nF  (0402) ← 紧贴 PHY 引脚   │
+  │    ├─── 4.7μF (0603) ← 距离 < 5mm     │
+  │    └─── 10μF 电解    ← 在 PCB 背面     │
+  │         ↓                               │
+  │    PHY_VDD ← 电源引脚和电容之间走线 ≤2mm │
+  └─────────────────────────────────────┘
+```
+
+修复后示波器测量：
+
+```
+示波器截图描述：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CH1: PHY 3.3V 电源  (500mV/div, AC耦合)
+
+时间轴: 200ms/div
+
+波形: 纹波从 200mVpp 降至约 20mVpp
+      Link 断开现象完全消失
+      电压跌落从 400mV 降至 <50mV
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+量产验证：连续运行 72 小时，Link 无一次断开。
+
+#### 预防
+
+1. **去耦电容布局规则**：每个电源引脚配一个 100nF 陶瓷电容，距离引脚走线不超过 2mm。电容的接地端尽量短接到地平面。
+2. **电源纹波要求**：PHY 供电纹波控制在 ±5%（3.3V 电源不超过 165mVpp，最好 <50mVpp）。
+3. **如需长距离供电**：在 PHY 旁边加一个 LDO（低压差线性稳压器）二次稳压。
+4. **软件去抖**：即使硬件解决了，软件也要做去抖处理（参考第 5.4 节），防止偶发误报。
+
+---
+
+### Case 3: MDIO 部分寄存器读到 0xFFFF
+
+#### 症状
+
+代码读取 PHY 寄存器时，有些寄存器（如 0x00-0x0F）能正常返回有效值，但另一些寄存器（如 0x10-0x1F）返回 `0xFFFF`。
+
+#### 看到的现场
+
+串口寄存器 Dump：
+
+```
+===== PHY Register Dump (addr=0x00) =====
+Reg 0x00: 0x3100  [0011 0001 0000 0000]  ← OK
+Reg 0x01: 0x782D  [0111 1000 0010 1101]  ← OK
+Reg 0x02: 0x0007  [0000 0000 0000 0111]  ← OK
+Reg 0x03: 0xC0F1  [1100 0000 1111 0001]  ← OK
+Reg 0x04: 0x01E1  [0000 0001 1110 0001]  ← OK
+Reg 0x05: 0x01E1  [0000 0001 1110 0001]  ← OK
+...
+Reg 0x0F: 0x0000  [0000 0000 0000 0000]  ← OK
+
+Reg 0x10: 0xFFFF  [1111 1111 1111 1111]  ← 异常!
+Reg 0x11: 0xFFFF  [1111 1111 1111 1111]  ← 异常!
+Reg 0x12: 0xFFFF  [1111 1111 1111 1111]  ← 异常!
+...
+Reg 0x1F: 0xFFFF  [1111 1111 1111 1111]  ← 异常!
+```
+
+令人困惑的是，有些 `0xFFFF` 读取也会间歇性返回未知值，但 `0x00-0x0F` 始终正常。
+
+#### 根因分析
+
+**根本原因**：该 PHY 芯片（LAN8720A）的寄存器地址空间没有全部实现。根据数据手册，LAN8720A 只实现了以下寄存器：
+
+```
+LAN8720A 寄存器映射 (已实现):
+┌────────┬──────────────────────┐
+│ 0x00   │ BMCR (基本控制)       │ ← 标准
+│ 0x01   │ BMSR (基本状态)       │ ← 标准
+│ 0x02   │ PHYIDR1              │ ← 标准
+│ 0x03   │ PHYIDR2              │ ← 标准
+│ 0x04   │ ANAR                 │ ← 标准
+│ 0x05   │ ANLPAR               │ ← 标准
+│ 0x06   │ ANER                 │ ← 标准
+│ 0x08   │ MCSR (主从配置)       │ ← 可选
+│ 0x0B   │ MII Control          │ ← 可选
+│ 0x0C   │ MII Status           │ ← 可选
+│ 0x10   │ ASR (辅助状态)        │ ← 厂商特有
+│ 0x1B   │ MSC (模式选择)        │ ← 厂商特有
+│ 0x1D   │ ISR (中断状态)        │ ← 厂商特有
+│ 0x1E   │ IMR (中断屏蔽)        │ ← 厂商特有
+│ 0x1F   │ SCSR (特殊控制/状态)   │ ← 厂商特有
+├────────┼──────────────────────┤
+│ 其它   │ 未实现 → 读回 0xFFFF  │ ← 这是规范行为!
+└────────┴──────────────────────┘
+```
+
+读取未实现的寄存器时，MDIO 总线上的 PHY 不会驱动数据线，MDIO 的上拉电阻将数据线拉到高电平，因此读到 `0xFFFF`。
+
+文档中关于寄存器范围的说明：
+
+```
+IEEE 802.3 Clause 22:
+- 地址 0x00-0x0F: 基本寄存器 (前 16 个)
+  - 0x00-0x08: 必须实现
+  - 0x09-0x0F: 可选的扩展寄存器
+- 地址 0x10-0x1F: 厂商自定义 (每个芯片不同)
+  - 即使地址存在，不同芯片实现的寄存器也不同
+  - 读未实现寄存器 = 0xFFFF
+```
+
+#### 修复
+
+修改寄存器 Dump 函数，只读取芯片支持的寄存器范围：
+
+```c
+// LAN8720A 支持的寄存器列表
+static const uint8_t lan8720a_valid_regs[] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+    0x08,
+    0x0B, 0x0C,
+    0x10,
+    0x1B, 0x1D, 0x1E, 0x1F
+};
+#define LAN8720A_VALID_REGS_COUNT (sizeof(lan8720a_valid_regs) / sizeof(lan8720a_valid_regs[0]))
+
+void phy_dump_registers_safe(PHY_Device *dev) {
+    uint16_t val;
+    uint16_t id1, id2;
+
+    dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, 0x02, &id1);
+    dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, 0x03, &id2);
+    uint32_t phy_id = ((uint32_t)id1 << 16) | id2;
+
+    const uint8_t *regs;
+    int count;
+
+    // 根据 PHY ID 选择对应的寄存器列表
+    if (phy_id == 0x0007C0F1) {         // LAN8720A
+        regs = lan8720a_valid_regs;
+        count = LAN8720A_VALID_REGS_COUNT;
+    } else if (phy_id == 0x2000A0B1) {  // DP83848
+        regs = dp83848_valid_regs;
+        count = DP83848_VALID_REGS_COUNT;
+    } else {
+        // 未知 PHY: 扫描全部 0x00-0x1F, 但跳过 0xFFFF
+        printf("Unknown PHY, scanning all registers...\n");
+        for (uint8_t r = 0; r <= 0x1F; r++) {
+            dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, r, &val);
+            if (val != 0xFFFF) {
+                printf("  Reg 0x%02X: 0x%04X\n", r, val);
+            }
+        }
+        return;
+    }
+
+    printf("Registers for PHY ID 0x%08X:\n", phy_id);
+    for (int i = 0; i < count; i++) {
+        dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, regs[i], &val);
+        printf("  Reg 0x%02X: 0x%04X\n", regs[i], val);
+    }
+}
+```
+
+#### 预防
+
+1. **永远不要假设所有 0x00-0x1F 寄存器都可用**。查阅数据手册的寄存器映射表，只读取已实现的寄存器。
+2. **如果读到 0xFFFF**，先确认这个寄存器在数据手册中是否存在。不要盲目认为 PHY 坏了。
+3. **写一个芯片特定的寄存器列表**，用 PHY ID 自动选择，方便移植。
+4. **通用扫描工具应跳过 0xFFFF 寄存器**，但仍需列出地址以方便检查。
+
+---
+
+### Case 4: Auto-Negotiation 永不完成
+
+#### 症状
+
+PHY 初始化代码启动 Auto-Neg 后，BMSR.bit5（Auto-Neg Complete）永远不置位。等待 4 秒后超时，Link 始终建立不起来。
+
+#### 看到的现场
+
+串口输出：
+
+```
+=== PHY Auto-Neg Test ===
+PHY ID: 0x0007C0F1 (LAN8720A)
+ANAR 配置: 0x01E1 (发布 10/100M FD/HD)
+BMCR 写入: 0x1200 (使能 ANEG + 重启)
+等待协商完成...
+[T=0ms]   BMSR=0x7828  ANEG_DONE=0  Link=UP    ← Link 已经 UP!
+[T=200ms] BMSR=0x7828  ANEG_DONE=0  Link=UP    ← 但协商始终不完成
+[T=400ms] BMSR=0x7828  ANEG_DONE=0  Link=UP
+[T=600ms] BMSR=0x7828  ANEG_DONE=0  Link=UP
+...
+[T=4000ms] 错误: 协商超时!
+```
+
+注意：Link 已经建立（BMSR bit2=1），但 ANEG_DONE（bit5）始终为 0。这说明物理连接是通的，但自动协商协议没有完成。
+
+读取 ANER（Auto-Neg Expansion Register, 0x06）：
+
+```c
+uint16_t aner = mdio_read(0x00, 0x06);
+// aner = 0x0011
+// bit4 (PDF, Parallel Detection Fault) = 1  ← 关键线索!
+// bit0 (LP_AUTO_NEG_ABLE) = 1
+```
+
+PDF=1 表示并行检测失败 —— PHY 检测到线缆上有信号（Link 脉冲），但是无法通过并行检测确定速度。
+
+进一步读取 ANLPAR 看看对端通告了什么能力：
+
+```c
+mdio_read(0x00, 0x01);  // 清 BMSR latch
+uint16_t anlpar = mdio_read(0x00, 0x05);
+// anlpar = 0x0000  (!!!)  对端没有发布任何能力
+```
+
+ANLPAR 全 0，说明对端根本不支持 Auto-Negotiation。对端是一个老旧设备（或配置为强制模式的设备），只发送 NLP（Normal Link Pulses）保持链路，但不发送 FLP（Fast Link Pulses）进行协商。
+
+#### 根因分析
+
+完整诊断流程：
+
+```
+检查 BMSR.bit5 (ANEG_DONE) = 0?
+    │
+    ├── 读取 ANER (0x06)
+    │     │
+    │     ├── bit4 (PDF)=1? → 并行检测失败
+    │     │     │              对端可能不支持 Auto-Neg
+    │     │     │
+    │     │     └── 读取 ANLPAR (0x05)
+    │     │           │
+    │     │           ├── ANLPAR = 0x0000?
+    │     │           │     → 确认: 对端不支持 Auto-Neg
+    │     │           │
+    │     │           └── ANLPAR ≠ 0?
+    │     │                 → PDF 可能是其他原因 (线缆噪声)
+    │     │
+    │     ├── bit0=0? → 对端不支持 ANEG
+    │     │     → 需要强制模式 (parallel detection fallback)
+    │     │
+    │     └── 正常 → 继续等待，或检查硬件
+    │
+    └── 链路是否建立 (BMSR.bit2=1)?
+          │
+          ├── Link=1, ANEG_DONE=0 → 典型"对端不支持 ANEG"场景
+          │
+          └── Link=0 → 物理层问题 (线缆/连接器/供电)
+```
+
+#### 修复
+
+回退到强制模式（Parallel Detection Fallback）。当 Auto-Neg 超时且 Link 已建立时，强制设置速度和双工：
+
+```c
+// Auto-Neg 回退逻辑
+#define AUTONEG_TIMEOUT_MS  4000   // 协商超时时间
+
+int phy_autoneg_with_fallback(PHY_Device *dev) {
+    uint32_t start = HAL_GetTick();
+    uint16_t bmsr, aner;
+
+    printf("启动 Auto-Neg...\n");
+
+    // 1. 先尝试 Auto-Neg
+    phy_start_autoneg(dev);
+
+    // 2. 等待协商完成
+    while ((HAL_GetTick() - start) < AUTONEG_TIMEOUT_MS) {
+        dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, 0x01, &bmsr);
+        dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, 0x01, &bmsr);
+
+        if (bmsr & (1 << 5)) {  // ANEG_DONE
+            printf("Auto-Neg 成功完成!\n");
+            return 0;  // 正常完成
+        }
+
+        // 检查是否进入了并行检测模式
+        if (bmsr & (1 << 2)) {  // Link UP
+            dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, 0x06, &aner);
+            if (aner & (1 << 4)) {  // PDF = Parallel Detection Fault
+                printf("并行检测失败 (PDF=1), 尝试强制模式...\n");
+                break;
+            }
+        }
+
+        delay_ms(50);
+    }
+
+    // 3. 回退到强制模式
+    printf("Auto-Neg 超时，回退到强制模式...\n");
+    return phy_force_mode(dev);
+}
+
+// 强制设置速度和双工
+int phy_force_mode(PHY_Device *dev) {
+    uint16_t bmcr;
+
+    // 先读当前 BMCR
+    dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, 0x00, &bmcr);
+
+    // 清除 Auto-Neg 相关位
+    bmcr &= ~((1 << 12) | (1 << 9) | (1 << 13) | (1 << 6) | (1 << 8));
+
+    // 强制设置为 100M 全双工 (最常见场景)
+    // bit13=1, bit6=0 → 100M
+    // bit8=1 → 全双工
+    bmcr |= (1 << 13);   // Speed(LSB) = 1
+    bmcr |= (1 << 8);    // Duplex = 1
+    // bit6=0 → Speed(MSB) = 0
+    // 组合: 01 → 100M
+
+    // 关键: 关闭 Auto-Neg 使能位
+    bmcr &= ~(1 << 12);  // Auto-Neg Enable = 0
+
+    dev->bus->write_c22(dev->bus->bus_priv, dev->phy_addr, 0x00, bmcr);
+
+    printf("强制模式: BMCR=0x%04X (100M 全双工, Auto-Neg 关闭)\n", bmcr);
+
+    // 等待链路稳定
+    delay_ms(300);
+
+    // 验证
+    dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, 0x01, &bmsr);
+    dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, 0x01, &bmsr);
+
+    if (bmsr & (1 << 2)) {
+        printf("强制模式链路已建立!\n");
+        dev->link.link_up = 1;
+        dev->link.speed_100m = 1;
+        dev->link.full_duplex = 1;
+        dev->link.autoneg_done = 0;  // 标记为非协商模式
+        return 0;
+    }
+
+    // 如果 100M FD 不行，尝试其他组合
+    printf("100M FD 失败，尝试 10M HD...\n");
+    bmcr = 0x0000;  // 10M 半双工 (复位后默认)
+    dev->bus->write_c22(dev->bus->bus_priv, dev->phy_addr, 0x00, bmcr);
+    delay_ms(300);
+
+    dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, 0x01, &bmsr);
+    dev->bus->read_c22(dev->bus->bus_priv, dev->phy_addr, 0x01, &bmsr);
+
+    if (bmsr & (1 << 2)) {
+        printf("10M HD 模式链路已建立!\n");
+        dev->link.link_up = 1;
+        dev->link.speed_100m = 0;
+        dev->link.full_duplex = 0;
+        dev->link.autoneg_done = 0;
+        return 0;
+    }
+
+    printf("强制模式失败: 所有组合均无法建立链路\n");
+    return -1;
+}
+```
+
+#### 预防
+
+1. **Auto-Neg 永远设超时**，不要无限等待。3-4 秒是合理的超时值。
+2. **检查 ANER 的 PDF 位**：在等待协商过程中定期检查 PDF（bit4），如果检测到 PDF，立即回退到强制模式，不要等到超时。
+3. **对端能力检查**：在启动 Auto-Neg 之前，可以读取 BMSR.bit3（Auto-Neg Ability），如果该位为 0，说明本 PHY 不支持协商，直接强制模式。
+4. **产品配置策略**：对于已知连接固定设备的场景（如工业设备连接 PLC），可以直接强制模式，跳过协商过程，节省 2-3 秒的启动时间。
+
+---
+
+### Case 5: PHY 中断风暴导致 MCU 卡死
+
+#### 症状
+
+使能 PHY 中断后，MCU 不断进入中断服务函数，无法执行正常的主循环代码。程序看起来"卡死"了，串口输出停止，但用调试器暂停可以看到 CPU 总是在 `EXTI_IRQHandler` 中。
+
+#### 看到的现场
+
+调试器暂停后的 Call Stack（调用栈）：
+
+```
+HardFault_Handler
+  └── EXTI0_IRQHandler          ← 反复进入
+        └── phy_irq_handler
+              └── mdio_read     ← 可能在这里异常
+```
+
+或者没有 HardFault，但：
+
+```
+Breakpoint at main_loop() line 42:
+  从未命中! 程序一直在中断里循环
+```
+
+检查串口输出（如果能输出的话）：
+
+```
+[IRQ] PHY 中断触发! ISR = 0xFFFF
+[IRQ] PHY 中断触发! ISR = 0xFFFF
+[IRQ] PHY 中断触发! ISR = 0xFFFF
+[IRQ] PHY 中断触发! ISR = 0xFFFF   ← 无限重复!
+```
+
+ISR 值为 0xFFFF，意味着所有中断源都 pending。
+
+#### 根因分析
+
+**问题代码**（错误的中断服务函数写法）：
+
+```c
+// ===== 错误的中断服务函数 =====
+// 问题: 使用电平触发中断，但在 ISR 中未清除中断源
+
+void EXTI0_IRQHandler(void) {
+    // 检查中断标志
+    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_0) != RESET) {
+        phy_irq_handler(0);           // 调用 PHY 中断处理
+        // __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_0);   ← 忘记清除 MCU 侧中断!
+    }
+}
+
+void phy_irq_handler(uint8_t phy_addr) {
+    // 问题: 没有读取 ISR 寄存器清除 PHY 中断!
+    // 只是打印了一下就返回了
+    printf("[IRQ] PHY interrupt!\n");
+
+    // 读取 BMSR 检查链路状态
+    uint16_t bmsr = mdio_read(phy_addr, 0x01);  // 只读了一次!
+    // 应该: 读两次 + 读取 ISR 清除中断
+}
+```
+
+**为什么导致风暴**：
+
+```
+时间线:
+1. PHY 检测到 Link 变化 → nINT 引脚拉低 (电平触发)
+2. MCU 进入 EXTI0_IRQHandler
+3. ISR 调用 phy_irq_handler()
+4. phy_irq_handler() 没有读取 PHY 的 ISR 寄存器
+   → PHY 认为中断未被处理，nINT 保持低电平
+5. ISR 返回
+6. 因为 nINT 仍然是低电平 → MCU 立即再次触发中断
+7. 回到步骤 2，无限循环
+```
+
+电平触发中断的特性：中断引脚的电平保持有效状态时，CPU 会反复触发中断。只有读取 PHY 的 ISR 寄存器让 PHY 拉高 nINT 引脚，中断才会停止。
+
+#### 修复
+
+正确的中断服务函数：
+
+```c
+// ===== 正确的中断服务函数 =====
+// 黄金法则: 读取 ISR 寄存器来清除 PHY 的中断状态
+
+void EXTI0_IRQHandler(void) {
+    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_0) != RESET) {
+        phy_irq_handler(0);
+        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_0);  // 清除 MCU 侧中断标志
+    }
+}
+
+void phy_irq_handler(uint8_t phy_addr) {
+    uint16_t isr;
+
+    // 关键: 读取 ISR 寄存器 (LAN8720A 读即清除)
+    // 这一操作会让 PHY 拉高 nINT 引脚
+    isr = mdio_read(phy_addr, LAN8720A_REG_ISR);  // 0x1D
+
+    // 如果 ISR 读回 0xFFFF, 可能是 MDIO 通信异常
+    if (isr == 0xFFFF) {
+        printf("[IRQ] 警告: ISR=0xFFFF, MDIO 可能异常!\n");
+        return;
+    }
+
+    printf("[IRQ] PHY 中断! ISR = 0x%04X\n", isr);
+
+    if (isr & LAN8720A_ISR_LINK_UP) {
+        // 延迟等待链路稳定
+        delay_ms(50);
+
+        // 读两次 BMSR 获取真实链路状态
+        mdio_read(phy_addr, 0x01);  // 清 latch
+        uint16_t bmsr = mdio_read(phy_addr, 0x01);
+
+        if (bmsr & (1 << 2)) {
+            printf("[IRQ] Link UP\n");
+            g_link_state = 1;
+        }
+    }
+
+    if (isr & LAN8720A_ISR_LINK_DOWN) {
+        // 读两次 BMSR 确认
+        mdio_read(phy_addr, 0x01);
+        uint16_t bmsr = mdio_read(phy_addr, 0x01);
+
+        if (!(bmsr & (1 << 2))) {
+            printf("[IRQ] Link DOWN\n");
+            g_link_state = 0;
+        }
+    }
+
+    if (isr & LAN8720A_ISR_ANEG_DONE) {
+        printf("[IRQ] Auto-Neg 完成\n");
+    }
+
+    if (isr & LAN8720A_ISR_REMOTE_FLT) {
+        printf("[IRQ] 远端故障\n");
+    }
+}
+```
+
+#### 预防
+
+1. **中断类型选择**：对于 PHY 中断，使用**边沿触发**（Falling Edge）而不是**电平触发**（Level Low）。边沿触发只会在引脚电平变化时触发一次，不会像电平触发那样持续触发。
+
+```c
+// 在 CubeMX 或代码中配置边沿触发
+GPIO_InitTypeDef gpio = {0};
+gpio.Pin = PHY_INT_PIN;
+gpio.Mode = GPIO_MODE_IT_FALLING;  // 边沿触发，非电平触发!
+gpio.Pull = GPIO_PULLUP;           // nINT 开漏，外部上拉，默认高电平
+HAL_GPIO_Init(PHY_INT_PORT, &gpio);
+```
+
+2. **ISR 黄金法则**：**每个 PHY 中断服务函数必须读取 ISR 寄存器**。如果 ISR 是"读即清除"类型，读取 ISR 是清除中断的唯一方式。
+
+3. **中断标志位去抖**：在 ISR 中设置一个标志，在主循环或任务中处理具体业务逻辑，减少 ISR 执行时间。
+
+```c
+// 推荐架构: ISR 只做最轻量的事
+volatile uint8_t g_phy_int_pending = 0;
+
+void EXTI0_IRQHandler(void) {
+    if (__HAL_GPIO_EXTI_GET_IT(GPIO_PIN_0) != RESET) {
+        g_phy_int_pending = 1;                     // 设置标志
+        __HAL_GPIO_EXTI_CLEAR_IT(GPIO_PIN_0);      // 清 MCU 标志
+    }
+}
+
+// 在主循环中处理
+void main_loop(void) {
+    while (1) {
+        if (g_phy_int_pending) {
+            g_phy_int_pending = 0;
+            phy_irq_handler(0);  // 在主循环中调用，不在 ISR 中
+        }
+        // ... 其他任务
+    }
+}
+```
+
+4. **中断超时保护**：如果连续 N 次中断 ISR 值相同，可能是 PHY 故障，此时可以暂时禁用中断。
+
+---
+
+### Case 6: Wireshark 抓到 CRC 错误包
+
+#### 症状
+
+设备正常通信，Ping 大部分成功，但偶尔出现超时。在 PC 上用 Wireshark 抓包发现有一些数据包的 Ethernet FCS（Frame Check Sequence）错误：
+
+```
+Wireshark 截图描述:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+No.  Time      Source          Destination      Info
+ 1   0.000     PC              DevBoard         Echo (ping) request
+ 2   0.001     DevBoard        PC               Echo (ping) reply
+ 3   0.002     PC              DevBoard         Echo (ping) request
+ 4   0.003     DevBoard        PC               Echo (ping) reply
+ 5   0.005     DevBoard        PC               [Malformed Packet] ← !
+ 6   0.006     PC              DevBoard         Echo (ping) request
+ 7   0.009     DevBoard        PC               Echo (ping) reply
+
+帧 5: 帧长 1518 字节，Ethernet FCS 校验错误
+      (Wireshark 标注: [Expert Info (Error/Malformed): FCS Error])
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+错误不是持续发生，而是大约每 100-200 个包出现一次。错误包的帧长都是 1518 字节（最大帧长），且错误随机分布。
+
+在 MCU 端检查 MAC 的错误计数器：
+
+```c
+// 以 STM32 ETH MAC 为例
+uint32_t alignd_err = ETH->MACRCR;  // 接收错误计数器
+// MACRCR bit3: CRC Error
+// MACRCR bit2: Alignment Error
+// 这些计数器在增加!
+```
+
+#### 根因分析
+
+这是典型的 **RMII 时钟抖动/偏斜** 问题。
+
+RMII 接口的信号时序：
+
+```
+RMII 时钟拓扑:
+
+方案 A (正确):
+  50MHz 晶振 ────┬─── PHY  ──── REF_CLK ──── MCU
+                 │
+                 └─── (PHY 内部生成 50MHz REF_CLK 输出给 MCU)
+
+方案 B (错误):
+  MCU ──── REF_CLK ──── PHY
+  (MCU 的 MCO 引脚输出 50MHz 给 PHY，但走线过长)
+
+方案 C (另一种错误):
+  两个独立的 50MHz 晶振:
+  晶振1 ──── PHY
+  晶振2 ──── MCU
+  (两个晶振频率有微小差异，导致时钟漂移)
+```
+
+在这个案例中，PCB 使用了方案 C —— 两个独立的 50MHz 有源晶振分别给 PHY 和 MCU 提供 RMII REF_CLK。用示波器测量两个时钟信号：
+
+```
+示波器截图描述 (CH1=PHY REF_CLK, CH2=MCU REF_CLK):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+时间轴: 10ns/div (看偏斜), 或 1us/div (看漂移)
+
+CH1: 50.000MHz, 占空比 50%, Vpp=3.3V
+CH2: 50.001MHz, 占空比 48%, Vpp=3.1V
+     ↑ 两个晶振频率差了 1kHz!
+     
+长时间观察 (1ms/div):
+CH1 和 CH2 的相位差从 0° 逐渐漂移到 180°，然后回到 0°
+周期性地对齐和错开
+
+在相位差接近 180° 时: CRC 错误大量出现
+在相位差接近 0° 时: 通信正常
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+RMII 要求 REF_CLK 的频率精度为 ±50ppm（百万分之五十），即 50MHz 时偏差不超过 ±2.5kHz。50.000MHz 和 50.001MHz 相差 1kHz（20ppm），看似在规格内。但问题在于**两个晶振的相对偏差**和**占空比差异**：
+
+1. 两个晶振的频率差导致时钟相位持续漂移
+2. 在相位差最大时，MCU 在时钟边沿采样数据时可能采到数据线上的毛刺或过渡状态
+3. 占空比 48% 意味着高电平时间稍短，对某些芯片可能接近时序裕量边界
+
+#### 修复
+
+改用方案 A：由 PHY 提供 REF_CLK 给 MCU，确保 PHY 和 MCU 使用**同一个时钟源**。
+
+```
+修复后的时钟拓扑:
+
+  25MHz 晶振 ──── LAN8720A ──── REF_CLK(50MHz) ──── MCU
+                          ↑
+                   PHY 内部 PLL 将 25MHz 倍频到 50MHz
+                   50MHz REF_CLK 从 PHY 的 REF_CLKO 引脚输出
+```
+
+或者在只有一个 50MHz 晶振的情况下：
+
+```
+  50MHz 晶振 ────┬─── PHY (REF_CLK 输入)
+                 │
+                 └─── MCU (ETH_RMII_REF_CLK)
+```
+
+改动后，用示波器验证：
+
+```
+示波器截图描述 (修复后):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CH1: PHY REF_CLK (50MHz)
+CH2: MCU REF_CLK (50MHz) — 同源
+
+两个时钟完全同频同相，无漂移
+占空比 50%，Vpp=3.3V
+长时间观察 (10ms/div): 相位固定不变
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+修复后运行 24 小时，Wireshark 未抓到任何 CRC 错误包。
+
+#### 预防
+
+1. **RMII 必须使用单一时钟源**：PHY 和 MAC 必须共享同一个 REF_CLK。推荐由 PHY 输出 REF_CLK 给 MCU。
+2. **时钟走线**：REF_CLK 是高速信号（50MHz），走线要短，远离其他高速信号，避免串扰。
+3. **PCB 设计时考虑时钟偏斜**：REF_CLK 到 PHY 和到 MCU 的走线长度差控制在 ±5mm 以内。
+4. **如果只能用两个晶振**：选择频率精度 ±25ppm 或更好的晶振，并在固件中增加 CRC 错误计数监控。
+5. **调试时先用 Wireshark 确认**：CRC 错误一般是物理层问题。如果 Wireshark 报告 FCS 错误，排查顺序：时钟 → 电源 → 信号完整性 → 网线质量。
+
+---
+
+### Case 7: 首板 Bring-Up —— 什么都读不到
+
+#### 症状
+
+新做的 PCB 板第一次上电，MDIO 总线读任何 PHY 地址都返回 `0x0000` 或 `0xFFFF`。PHY ID 读不到，Link LED 不亮。
+
+#### 看到的现场
+
+串口输出：
+
+```
+PHY Detection: Scanning addresses 0x00-0x1F...
+  Addr 0x00: ID=0x00000000 ← 无响应
+  Addr 0x01: ID=0x00000000 ← 无响应
+  Addr 0x02: ID=0x00000000 ← 无响应
+  ...
+  Addr 0x1F: ID=0x00000000 ← 无响应
+错误: 未检测到 PHY!
+```
+
+或：
+
+```
+PHY Detection: Scanning addresses 0x00-0x1F...
+  Addr 0x00: ID=0xFFFFFFFF ← 全 F
+  Addr 0x01: ID=0xFFFFFFFF ← 全 F
+  ...
+错误: 未检测到 PHY!
+```
+
+新板，第一次上电，没有任何进展。
+
+#### 根因分析 —— 系统故障排查流程
+
+这是最考验耐心和系统化思维的问题。不要猜，按以下流程一步一步排查：
+
+```
+新板 PHY 调试流程
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                           ┌─────────────────────────────┐
+                           │  Step A: 检查电源            │
+                           │  PHY_VDD = 3.3V?             │
+                           │  VDD_CORE = 1.2V?            │
+                           └─────────────┬───────────────┘
+                                         │ 不正常
+                                         ▼
+                           ┌─────────────────────────────┐
+                           │  Step B: 检查复位引脚         │
+                           │  nRST 上电后是否变为高电平?   │
+                           └─────────────┬───────────────┘
+                                         │ 不正常
+                                         ▼
+                           ┌─────────────────────────────┐
+                           │  Step C: 检查时钟             │
+                           │  晶振 25MHz 起振?            │
+                           │  REF_CLK 有 50MHz 输出?      │
+                           └─────────────┬───────────────┘
+                                         │ 不正常
+                                         ▼
+                           ┌─────────────────────────────┐
+                           │  Step D: 检查 MDIO 上拉      │
+                           │  MDIO 电压 = 3.3V?           │
+                           │  上拉电阻 1.5k~2.2k?         │
+                           └─────────────┬───────────────┘
+                                         │ 不正常
+                                         ▼
+                           ┌─────────────────────────────┐
+                           │  Step E: 尝试不同 PHY 地址   │
+                           │  Strapping 引脚决定了地址    │
+                           └─────────────┬───────────────┘
+                                         │ 不正常
+                                         ▼
+                           ┌─────────────────────────────┐
+                           │  Step F: 示波器看 MDIO       │
+                           │  确认 MDIO/MDC 信号时序     │
+                           └─────────────────────────────┘
+```
+
+#### Step A: 检查电源
+
+**万用表测量**：
+
+```
+引脚               | 期望值  | 实测值  | 判断
+───────────────────|─────────|────────|──────
+PHY 3.3V (VDD)    | 3.3V    | 3.28V  | OK (±5% 范围内)
+PHY 1.2V (VDD_CORE)| 1.2V   | 0.00V  | 异常! ←
+GND               | 0V      | 0V     | OK
+```
+
+LAN8720A 的 1.2V 核心电压可以由内部 LDO 从 3.3V 产生，但需要外部去耦电容。检查数据手册：
+
+```
+LAN8720A 内部 LDO 要求:
+  VDD_CORE (引脚 11): 内部 1.2V LDO 输出
+  外部必须接 10μF + 0.1μF 去耦电容到 GND
+  如果没有去耦电容, LDO 可能振荡或无输出
+```
+
+发现原理图中 VDD_CORE 引脚只画了一个 0.1μF 电容，但数据手册要求至少 10μF + 0.1μF。10μF 电容被遗漏了。
+
+**补充 10μF 电容后**，测量 VDD_CORE = 1.18V，恢复正常。
+
+#### Step B: 检查复位引脚
+
+PHY 的 nRST 引脚（有些芯片叫 RST_N）必须在上电后由低变高，释放复位。
+
+**万用表测量**：
+
+```
+引脚   | 上电后期望 | 实测     | 判断
+───────|────────────|──────────|───────
+nRST   | 3.3V       | 0.15V   | 异常!
+```
+
+nRST 一直是低电平，PHY 一直处于复位状态，不会响应 MDIO。
+
+**检查原理图**：
+
+```
+问题电路:
+                    3.3V
+                      │
+                      ├─── 10kΩ
+                      │
+  MCU_PA0 ────────────┴─── nRST (PHY 引脚)
+
+问题: 如果 MCU PA0 在上电时是 Open-Drain 或未初始化，
+      nRST 可能被 PA0 内部下拉到低电平!
+```
+
+**修复方法**：给 nRST 加一个外部上拉电阻（到 3.3V），或者在 MCU 初始化代码中先拉高 PA0，再使能 PHY 的复位时序。
+
+```c
+// 正确的复位初始化
+void phy_hardware_reset_init(void) {
+    GPIO_InitTypeDef gpio = {0};
+
+    // 先配置 RST 引脚为推挽输出，初始为高
+    gpio.Pin = PHY_RST_PIN;
+    gpio.Mode = GPIO_MODE_OUTPUT_PP;
+    gpio.Pull = GPIO_PULLUP;     // 内部上拉确保不是低电平
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(PHY_RST_PORT, &gpio);
+
+    // 确保复位释放
+    HAL_GPIO_WritePin(PHY_RST_PORT, PHY_RST_PIN, GPIO_PIN_SET);
+    delay_ms(100);
+
+    // 现在可以做 PHY 复位序列了
+    // (如果需要，再拉低-拉高)
+}
+```
+
+#### Step C: 检查时钟
+
+PHY 需要时钟才能工作。LAN8720A 需要外部 25MHz 晶振或 50MHz 时钟输入。
+
+**示波器测量晶振引脚**：
+
+```
+示波器截图描述 (无时钟):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CH1: XI (晶振输入), AC 耦合, 1V/div
+时间轴: 100ns/div
+
+波形: 一条平直的线，约 0.5V DC
+      → 晶振没有起振!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+晶振不起振的常见原因：
+
+| 原因 | 检查方法 | 修复 |
+|------|----------|------|
+| 晶振负载电容不匹配 | 计算 CL = (C1×C2)/(C1+C2) + 寄生电容 | 一般选 18pF~22pF |
+| 晶振焊错或损坏 | 换一个晶振 | 替换 |
+| PHY 工作模式设置错 | 检查 strapping 引脚 | 确认 nINT/REGOFF 模式 |
+| 电源未稳定 | 先检查 Step A | 供电正常后再看时钟 |
+
+**正确的 25MHz 晶振电路**：
+
+```
+LAN8720A 晶振电路:
+                    25MHz 晶振
+                  ┌──────────┐
+                  │          │
+  XI (Pin 5) ─────┤1        3├────── XO (Pin 4)
+                  │          │
+                  │    4    2├────── GND
+                  └──────────┘
+                     │    │
+                    ┌┴┐  ┌┴┐
+                    │ │  │ │  18pF (负载电容)
+                    └┬┘  └┬┘
+                     │    │
+                    GND  GND
+```
+
+修复晶振电路后（更换匹配的负载电容）：
+
+```
+示波器截图描述 (有时钟):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CH1: XI (晶振输入), AC 耦合, 1V/div
+时间轴: 20ns/div
+
+波形: 25.000MHz 正弦波, Vpp≈1.0V
+      稳定振荡!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+#### Step D: 检查 MDIO 上拉
+
+即使 PHY 已经正常工作，MDIO 通信仍然可能失败。
+
+**测量 MDIO 引脚电压**：
+
+```
+MDIO 引脚           | MCU 初始化前 | MCU 初始化后 (输入模式)
+───────────────────|─────────────|─────────────────────
+电压               | 0.1V        | 0.1V
+                   |             ↑ 应该是 3.3V!
+```
+
+MDIO 电压不对，说明上拉电阻有问题：
+
+- 原理图上画了 2.2k 上拉到 3.3V
+- 但检查 PCB，发现上拉电阻 R12 是**空贴**（Not Fitted/不焊接）
+
+在 PCB 上补焊一颗 2.2kΩ 电阻后：
+
+```
+MDIO 引脚           | MCU 初始化前 | MCU 初始化后
+───────────────────|─────────────|─────────────
+电压               | 3.3V        | 3.3V  ← OK
+```
+
+#### Step E: 尝试不同 PHY 地址
+
+PHY 地址由 strapping 引脚决定。LAN8720A 的 PHYAD0 引脚（复用 RXER 引脚）的状态决定了地址：
+
+```
+PHYAD0/RXER 引脚状态 | PHY 地址
+──────────────────────|─────────
+拉低 (10k 到 GND)    | 0x00  (最常见)
+拉高 (10k 到 3.3V)  | 0x01
+浮空                | 可能是 0x00 或 0x01 (不稳定)
+```
+
+商品模块上这个引脚的电平可能不同，所以不要假定地址是 0。扫描所有 32 个地址：
+
+```c
+// 暴力扫描所有 PHY 地址
+int phy_scan_all_addresses(MDIO_Bus *bus) {
+    uint16_t id1, id2;
+
+    for (uint8_t addr = 0; addr <= 31; addr++) {
+        if (bus->read_c22(bus->bus_priv, addr, 0x02, &id1) != 0)
+            continue;
+        if (id1 == 0x0000 || id1 == 0xFFFF)
+            continue;
+
+        bus->read_c22(bus->bus_priv, addr, 0x03, &id2);
+        if (id2 == 0x0000 || id2 == 0xFFFF)
+            continue;
+
+        uint32_t phy_id = ((uint32_t)id1 << 16) | id2;
+        printf("发现 PHY! 地址=0x%02X, ID=0x%08X\n", addr, phy_id);
+        return addr;
+    }
+
+    return -1;  // 没找到
+}
+```
+
+在这个案例中，PHY 地址是 0x01（模块上的 PHYAD0 被拉高了），而代码中默认用了地址 0x00。
+
+#### Step F: 示波器看 MDIO 波形
+
+如果以上所有步骤都检查了仍然不行，用示波器看 MDIO/MDC 的实际时序：
+
+```
+示波器截图描述 (正确的 MDIO 读操作):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CH1: MDC (时钟), 2V/div
+CH2: MDIO (数据), 2V/div
+时间轴: 2us/div
+
+波形分析:
+  [CH1] MDC: 约 1MHz 方波, 占空比 50%
+  [CH2] 前 32 位: 高电平 (PREAMBLE 32个1)
+        接着 14 位: 命令帧 (ST+OP+PHYAD+REGAD)
+        TA: 高阻 → 0
+        后 16 位: PHY 驱动的数据 (MDIO 从输出切换到输入)
+
+用光标测量:
+  MDC 频率: 1.04MHz (OK, ≤2.5MHz)
+  PRE 长度: 32个脉冲 (OK)
+  帧格式: ST=01, OP=10 (OK)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+与正确的波形对比：
+
+```
+示波器截图描述 (错误的 MDIO 读操作 ─ 缺少 PREAMBLE):
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CH1: MDC
+CH2: MDIO
+
+波形: ST 和 OP 字段之前没有 32 个 1
+      直接在 MDIO 上发送了命令
+      
+问题: 有些 MDIO 控制器或软件实现忘记发送 PREAMBLE
+      大多数 PHY 可以容忍缺少 PREAMBLE, 但不是所有
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+**修复 PREAMBLE**：确保 MDIO 驱动在每次读/写前发送 32 个 1。
+
+#### 综合诊断决策表
+
+```
+问题: PHY ID 返回 0x0000 或 0xFFFF
+
+读到 0x0000?
+  ├── MDIO 引脚是推挽输出? → 改为开漏输出
+  ├── MDIO 上拉电阻缺失?  → 加 1.5k~2.2k 上拉
+  └── MDC 没有时钟?       → 检查 GPIO 配置和时钟
+
+读到 0xFFFF?
+  ├── PHY 没上电?         → 测量 VDD 3.3V 和 VDD_CORE 1.2V
+  ├── PHY 在复位状态?     → 测量 nRST 引脚
+  ├── PHY 时钟没起振?     → 示波器看晶振
+  ├── PHY 地址不对?       → 扫描 0-31 地址
+  └── 示波器看 MDIO 没信号→ 检查 GPIO 初始化代码
+
+MDIO 波形看起来正常但读回 0xFFFF?
+  ├── PREAMBLE 不够?      → 发送完整 32 个 1
+  ├── MDC 频率太高?       → 降到 ≤2.5MHz
+  └── PHY 地址/reg 地址错位? → 用示波器 decode 确认
+```
+
+#### 综合修复后的 Bring-Up Checklist
+
+```c
+// 新板 PHY Bring-Up 完整检查程序
+void phy_bring_up_checklist(void) {
+    printf("\n========== PHY Bring-Up 检查清单 ==========\n");
+
+    // [√] Step A: 电源
+    printf("Step A: 电源\n");
+    printf("  3.3V:  %s\n", check_voltage(3.3f, 3.3f, 0.15f) ? "OK" : "FAIL");
+    printf("  1.2V:  %s\n", check_voltage(1.2f, 1.2f, 0.10f) ? "OK" : "FAIL");
+
+    // [√] Step B: 复位
+    printf("Step B: nRST 引脚\n");
+    GPIO_PinState rst = HAL_GPIO_ReadPin(PHY_RST_PORT, PHY_RST_PIN);
+    printf("  nRST = %s\n", rst == GPIO_PIN_SET ? "HIGH (OK)" : "LOW (FAIL)");
+
+    // [√] Step C: 时钟 (通过读取 PHY 寄存器间接确认)
+    printf("Step C: 时钟\n");
+    uint16_t id1 = mdio_read(0x00, 0x02);
+    printf("  PHY ID1 = 0x%04X %s\n", id1, id1 != 0xFFFF ? "(OK)" : "(FAIL)");
+
+    // [√] Step D: MDIO 上拉
+    printf("Step D: MDIO 电平\n");
+    // 在输入模式下读取 MDIO 引脚
+    mdio_set_input();
+    GPIO_PinState mdio_level = HAL_GPIO_ReadPin(MDIO_PORT, MDIO_PIN);
+    printf("  MDIO 电平 = %s (应为 HIGH)\n",
+           mdio_level == GPIO_PIN_SET ? "HIGH" : "LOW");
+
+    // [√] Step E: 扫描地址
+    printf("Step E: 扫描 PHY 地址\n");
+    int found_addr = phy_scan_all_addresses(&g_mdio_bus);
+    if (found_addr >= 0) {
+        printf("  PHY 在地址 0x%02X 发现!\n", found_addr);
+    } else {
+        printf("  PHY 未找到! 检查以上步骤\n");
+    }
+}
+```
+
+---
+
+> **学习建议**：把这 7 个案例的调试思路记在心里。当你的 PHY 不工作时，不要只盯着代码看——用万用表测电压、示波器看时钟和 MDIO 时序，往往比看代码更快找到问题。**"先硬件，后软件"** 是调试物理层设备的铁律。
+
+---
+
 > **参考文档**
 >
 > - IEEE 802.3-2022 Clause 22 (MDIO/MDC Management)

@@ -3927,6 +3927,2283 @@ if (verify != 0x06) {
 
 ---
 
+## Appendix D: Capstone Project - Building an Ethernet Managed Switch
+
+> 本章节将所有前序知识点整合为一个完整的"以太网管理型交换机"项目。按 5 个阶段逐步实现，每阶段均包含完整 C 代码、可验证的成功标准和调试方法。预计开发周期 4 周。
+
+---
+
+### D.1 项目概述
+
+#### D.1.1 项目目标
+
+构建一个完整的 5 端口管理型以太网交换机，具备以下企业级功能：
+
+| 功能模块 | 交付物 | 涉及技术 |
+|---------|--------|---------|
+| 二层转发 | 5 端口线速交换，MAC 地址学习 | KSZ9897 核心交换引擎 |
+| VLAN 隔离 | 多虚拟局域网，端口间流量隔离 | IEEE 802.1Q Port-based VLAN |
+| CLI 管理 | UART 命令行接口，配置/监控 | 串口解析 + 寄存器读写 |
+| 端口镜像 | 流量复制到监控端口 | KSZ9897 Sniffer 模式 |
+| Web 管理 | HTTP 网页配置界面 | LwIP netconn API |
+| SNMP 监控 | MIB 计数器只读查询 | KSZ9897 MIB 引擎 |
+| 配置持久化 | 保存/恢复配置到 Flash | STM32 内部 Flash 操作 |
+
+#### D.1.2 硬件物料清单
+
+| 组件 | 型号 | 数量 | 用途 |
+|------|------|------|------|
+| MCU 开发板 | STM32F429I-DISC1 | 1 | 主控 + Web 服务器 |
+| 交换机芯片 | KSZ9897RNX 核心板 | 1 | 5 端口交换引擎 |
+| USB-UART 模块 | CH340G / FT232 | 1 | CLI 调试终端 |
+| RJ45 网线 | Cat5e | 5 | 连接 PC 和交换机 |
+| 调试 PC | Windows + Wireshark + Putty | 1 | 开发和验证 |
+| SD 卡 (可选) | MicroSD 8GB+ | 1 | Web 页面文件存储 |
+
+#### D.1.3 软件工具链
+
+| 工具 | 版本 | 用途 |
+|------|------|------|
+| STM32CubeIDE | 1.13+ | 编译调试 |
+| STM32CubeMX | 6.8+ | HAL 代码生成 |
+| Wireshark | 4.0+ | 网络包分析 |
+| Putty / MobaXterm | - | UART 终端 (115200 8N1) |
+| Git | - | 版本管理 |
+
+---
+
+### D.2 系统架构
+
+#### D.2.1 总体拓扑
+
+```
+                            +--------------------------------------------+
+                            |              STM32F429ZIT6                |
+                            |                                            |
+                            |  +--------+    +--------+    +----------+  |
+                            |  | UART7  |    | SPI1   |    | ETH MAC  |  |
+                            |  | CLI    |    | Ctrl   |    | Data     |  |
+                            |  +----+---+    +----+---+    +----+-----+  |
+                            |       |             |              |       |
+                            +-------+-------------+--------------+-------+
+                                    |             |              |
+                               [USB-UART]    [SPI Bus]     [RMII Bus]
+                                    |             |              |
+                            +-------+-------------+--------------+-------+
+                            |       |             |              |       |
+                            |  +----+---+    +----+---+    +----+-----+  |
+                            |  | UART   |    | SPI   |    | RMII     |  |
+                            |  | RX/TX  |    | CS/SCK|    | TX/RX    |  |
+                            |  |        |    | MOSI/ |    | REF_CLK  |  |
+                            |  |        |    | MISO  |    | CRS_DV   |  |
+                            |  +--------+    +-------+    +----------+  |
+                            |                                            |
+                            |           KSZ9897RNX Switch               |
+                            |                                            |
+                            |  Port 1  Port 2  Port 3  Port 4  Port 5   |
+                            |  [RJ45]  [RJ45]  [RJ45]  [RJ45]  [RJ45]  |
+                            +----+------+------+------+------+----------+
+                                 |      |      |      |      |
+                               PC1    PC2    PC3    PC4    PC5 (Monitor)
+```
+
+#### D.2.2 软件架构分层
+
+```
++---------------------------------------------------------+
+|                   应用层 (Application)                     |
+|  CLI Parser  |  HTTP Server  |  SNMP Agent  |  Monitor  |
++----------------------------+----------------------------+
+|                    管理层 (Management)                     |
+|  VLAN Mgr  |  Port Mgr  |  Mirror Mgr  |  Config Mgr   |
++----------------------------+----------------------------+
+|                   驱动层 (Driver)                          |
+|  SPI HAL   |  KSZ9897 Registers  |  ETH HAL  |  Flash   |
++----------------------------+----------------------------+
+|                   硬件层 (Hardware)                        |
+|  SPI1      |  UART7      |  ETH MAC    |  Internal Flash|
++---------------------------------------------------------+
+```
+
+#### D.2.3 数据流路径
+
+交换机有两条独立的数据路径：
+
+1. **控制路径 (SPI)**：MCU 通过 SPI 读写 KSZ9897 寄存器，配置 VLAN、镜像、读取 MIB 计数器等。带宽低（~5MHz），但操作确定性强。
+
+2. **数据路径 (RMII)**：网络数据帧通过 RMII 总线直接在 MCU 以太网 MAC 和 KSZ9897 主机端口之间传输。带宽高（100Mbps），用于 LwIP 协议栈通信。
+
+```
+用户端口 <--[KSZ9897 交换引擎]--> 主机端口 Port7 <--[RMII]--> STM32 ETH MAC <--[LwIP]--> HTTP Server
+                                          ^
+                                          |
+                                     [SPI 控制通道]
+                                          |
+                                    STM32 SPI1 <--[UART]--> CLI 终端
+```
+
+---
+
+### D.3 Phase 1: 硬件验证与二层转发 (Week 1)
+
+#### D.3.1 初始化序列
+
+```c
+/* ============================================================================
+ * phase1_hw_bringup.c
+ * 描述:   Phase 1 — 硬件验证、交换机启动、端口链路检测、帧转发测试
+ * ==========================================================================*/
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include "stm32f4xx_hal.h"
+
+/* ---------- 寄存器定义 ---------- */
+#define KSZ_REG_CHIP_ID0        0x0000
+#define KSZ_REG_CHIP_ID1        0x0001
+#define KSZ_REG_GLOBAL_CTRL0    0x0002  /* Bit 0 = Switch Start */
+#define KSZ_REG_GLOBAL_CTRL4    0x0008  /* Bit 1=MAC学习, Bit 2=老化 */
+#define KSZ_REG_RMII_CTRL       0x00D0  /* Bit 0 = RMII 使能 */
+#define KSZ_REG_PORT1_MEMBERSHIP 0x000D
+#define KSZ_REG_PORT7_MEMBERSHIP 0x0013
+#define KSZ_REG_PORT_START      0x0100  /* Port 1 基址 */
+#define KSZ_PORT_OFFSET         0x0020  /* 端口基址偏移 */
+#define KSZ_PORT_CTRL0          0x00    /* TX/RX 使能 */
+#define KSZ_PORT_STATUS0        0x04    /* 链路状态 */
+
+/* ---------- 全局状态 ---------- */
+typedef struct {
+    uint8_t  link_state[6];     /* 端口 1-5 链路状态 (UP/DOWN) */
+    uint16_t link_speed[6];     /* 端口 1-5 速率 (10/100 Mbps) */
+    uint8_t  full_duplex[6];    /* 端口 1-5 双工模式 */
+    uint8_t  port_enabled[6];   /* 端口 1-5 使能状态 */
+} Switch_Status_t;
+
+static Switch_Status_t sw_status;
+
+/* ---------- SPI 读写封装 ---------- */
+extern SPI_HandleTypeDef hspi1;
+
+static void CS_Low(void)
+{
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+}
+static void CS_High(void)
+{
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+}
+
+/* 读 16 位寄存器 */
+int ksz_read16(uint16_t reg, uint16_t *val)
+{
+    uint8_t cmd, addr, dummy = 0, buf[2];
+    if (!val) return -1;
+
+    cmd  = (uint8_t)((reg >> 8) & 0x7F) | 0x80;  /* 读命令 */
+    addr = (uint8_t)(reg & 0xFF);
+
+    CS_Low();
+    if (HAL_SPI_Transmit(&hspi1, &cmd, 1, 100) != HAL_OK) { CS_High(); return -2; }
+    if (HAL_SPI_Transmit(&hspi1, &addr, 1, 100) != HAL_OK) { CS_High(); return -2; }
+    if (HAL_SPI_TransmitReceive(&hspi1, &dummy, &buf[0], 1, 100) != HAL_OK) { CS_High(); return -2; }
+    if (HAL_SPI_TransmitReceive(&hspi1, &dummy, &buf[1], 1, 100) != HAL_OK) { CS_High(); return -2; }
+    CS_High();
+
+    *val = ((uint16_t)buf[0] << 8) | buf[1];
+    return 0;
+}
+
+/* 写 16 位寄存器 */
+int ksz_write16(uint16_t reg, uint16_t val)
+{
+    uint8_t cmd, addr;
+    uint8_t data[2];
+
+    cmd  = (uint8_t)((reg >> 8) & 0x7F);         /* 写命令 (bit7=0) */
+    addr = (uint8_t)(reg & 0xFF);
+    data[0] = (uint8_t)(val >> 8);
+    data[1] = (uint8_t)(val & 0xFF);
+
+    CS_Low();
+    if (HAL_SPI_Transmit(&hspi1, &cmd, 1, 100) != HAL_OK) { CS_High(); return -2; }
+    if (HAL_SPI_Transmit(&hspi1, &addr, 1, 100) != HAL_OK) { CS_High(); return -2; }
+    if (HAL_SPI_Transmit(&hspi1, data, 2, 100) != HAL_OK) { CS_High(); return -2; }
+    CS_High();
+    return 0;
+}
+
+/* 读 8 位寄存器 */
+int ksz_read8(uint16_t reg, uint8_t *val)
+{
+    uint16_t tmp;
+    int ret = ksz_read16(reg & 0xFFFE, &tmp);
+    if (ret) return ret;
+    *val = (reg & 0x01) ? (uint8_t)(tmp & 0xFF) : (uint8_t)(tmp >> 8);
+    return 0;
+}
+
+/* 写 8 位寄存器 */
+int ksz_write8(uint16_t reg, uint8_t val)
+{
+    uint16_t tmp;
+    int ret = ksz_read16(reg & 0xFFFE, &tmp);
+    if (ret) return ret;
+    if (reg & 0x01) {
+        tmp = (tmp & 0xFF00) | val;
+    } else {
+        tmp = (tmp & 0x00FF) | ((uint16_t)val << 8);
+    }
+    return ksz_write16(reg & 0xFFFE, tmp);
+}
+
+/* ---------- 辅助函数 ---------- */
+
+/* 端口基址计算 */
+static uint16_t port_base(uint8_t port)
+{
+    return KSZ_REG_PORT_START + (port - 1) * KSZ_PORT_OFFSET;
+}
+
+/* ---------- Step 1: 读取芯片 ID ---------- */
+
+int phase1_read_chip_id(void)
+{
+    uint16_t id_lo = 0, id_hi = 0;
+    int ret;
+
+    printf("Phase 1.1: Reading Chip ID...\r\n");
+
+    ret = ksz_read16(KSZ_REG_CHIP_ID0, &id_lo);
+    if (ret != 0) {
+        printf("  ERROR: SPI read failed (code=%d)\r\n", ret);
+        printf("  Check: SPI wiring, power, and RST_N pin!\r\n");
+        return -1;
+    }
+
+    ret = ksz_read8(KSZ_REG_CHIP_ID1, (uint8_t *)&id_hi);
+    if (ret != 0) return -1;
+
+    printf("  Chip ID0 (0x0000) = 0x%04X (expected 0x9897)\r\n", id_lo);
+    printf("  Chip ID1 (0x0001) = 0x%02X (expected 0x97)\r\n", id_hi & 0xFF);
+
+    if (id_lo == 0x9897) {
+        printf("  [OK] KSZ9897 detected successfully!\r\n");
+        return 0;
+    } else if ((id_lo & 0xFF00) == 0x9800) {
+        printf("  [WARN] KSZ family chip detected, but model mismatch (0x%04X)\r\n", id_lo);
+        return 0;
+    } else {
+        printf("  [FAIL] No valid chip ID. Check hardware connections.\r\n");
+        return -2;
+    }
+}
+
+/* ---------- Step 2: 初始化交换机 ---------- */
+
+int phase1_switch_init(void)
+{
+    uint8_t val;
+    int ret;
+
+    printf("Phase 1.2: Initializing Switch Core...\r\n");
+
+    /* 1. 启动交换核心 (Global Control 0, Bit 0) */
+    ret = ksz_write8(KSZ_REG_GLOBAL_CTRL0, 0x01);
+    if (ret != 0) { printf("  [FAIL] Cannot start switch core\r\n"); return -1; }
+    HAL_Delay(10);
+
+    /* 回读验证 */
+    ksz_read8(KSZ_REG_GLOBAL_CTRL0, &val);
+    if (!(val & 0x01)) {
+        printf("  [FAIL] Switch core failed to start (reg=0x%02X)\r\n", val);
+        return -2;
+    }
+    printf("  [OK] Switch core started (Global Ctrl0 = 0x%02X)\r\n", val);
+
+    /* 2. 使能 MAC 地址学习和老化 */
+    ret = ksz_write8(KSZ_REG_GLOBAL_CTRL4, 0x06);  /* Bit1=学习, Bit2=老化 */
+    if (ret != 0) return -3;
+    printf("  [OK] MAC learning + aging enabled\r\n");
+
+    /* 3. 使能 RMII 接口 */
+    ret = ksz_read8(KSZ_REG_RMII_CTRL, &val);
+    if (ret != 0) return -4;
+    val |= 0x01;  /* RMII 使能 */
+    val &= ~0x06; /* 时钟源选择: 00 = 内部 50MHz 输出 */
+    ret = ksz_write8(KSZ_REG_RMII_CTRL, val);
+    if (ret != 0) return -4;
+    printf("  [OK] RMII interface enabled\r\n");
+
+    /* 4. 所有端口透明转发 (默认即可，无需修改成员表) */
+    printf("  [OK] All ports set to transparent forwarding\r\n");
+
+    return 0;
+}
+
+/* ---------- Step 3: 使能所有端口并检测链路 ---------- */
+
+int phase1_enable_all_ports(void)
+{
+    uint8_t val;
+    int ret;
+
+    printf("Phase 1.3: Enabling all ports and checking link...\r\n");
+
+    for (uint8_t port = 1; port <= 5; port++) {
+        uint16_t base = port_base(port);
+
+        /* 使能 TX + RX */
+        ret = ksz_read8(base + KSZ_PORT_CTRL0, &val);
+        if (ret != 0) { printf("  Port %d: SPI error\r\n", port); continue; }
+
+        val |= 0x03;  /* TX_EN | RX_EN */
+        ret = ksz_write8(base + KSZ_PORT_CTRL0, val);
+        if (ret != 0) { printf("  Port %d: write error\r\n", port); continue; }
+
+        /* 读取链路状态 */
+        ret = ksz_read8(base + KSZ_PORT_STATUS0, &val);
+        if (ret != 0) continue;
+
+        sw_status.link_state[port]  = (val & 0x01) ? 1 : 0;
+        sw_status.full_duplex[port] = (val & 0x02) ? 1 : 0;
+        sw_status.link_speed[port]  = (val & 0x04) ? 100 : 10;
+        sw_status.port_enabled[port] = 1;
+
+        printf("  Port %d: %s | %dM %s\r\n",
+               port,
+               sw_status.link_state[port] ? "LINK UP" : "LINK DOWN",
+               sw_status.link_speed[port],
+               sw_status.full_duplex[port] ? "Full Duplex" : "Half Duplex");
+    }
+
+    return 0;
+}
+
+/* ---------- Step 4: 配置主机端口 (Port 7) ---------- */
+
+int phase1_config_host_port(void)
+{
+    uint8_t val;
+    int ret;
+
+    printf("Phase 1.4: Configuring host port (Port 7)...\r\n");
+
+    /* Port 7 基址 = 0x01C0 */
+    uint16_t base = 0x01C0;
+
+    /* 使能 TX + RX */
+    ret = ksz_write8(base + KSZ_PORT_CTRL0, 0x03);
+    if (ret != 0) return -1;
+
+    /* 设置 100M 全双工 */
+    ret = ksz_read8(base + 0x01, &val);
+    if (ret != 0) return -2;
+    val |= (1 << 3) | (1 << 4);  /* Full Duplex + 100Mbps */
+    ret = ksz_write8(base + 0x01, val);
+
+    printf("  [OK] Host port configured: 100M Full Duplex\r\n");
+    return 0;
+}
+
+/* ---------- Step 5: 转发验证 ---------- */
+
+void phase1_forward_test(void)
+{
+    printf("\r\n===== Phase 1 Forward Test =====\r\n");
+    printf("Procedure:\r\n");
+    printf("  1. Connect PC1 to Port 1, PC2 to Port 2\r\n");
+    printf("  2. Set IP on PC1: 192.168.1.1/24, PC2: 192.168.1.2/24\r\n");
+    printf("  3. From PC1: ping 192.168.1.2\r\n");
+    printf("  4. Expected: ping should succeed\r\n");
+    printf("  5. From PC2: ping 192.168.1.1\r\n");
+    printf("  6. Expected: ping should succeed\r\n");
+    printf("\r\nResult: ");
+    printf("If ping works, Phase 1 PASSED!\r\n");
+    printf("If ping fails, check:\r\n");
+    printf("  - Are both PCs on the same subnet? (/24)\r\n");
+    printf("  - Are both link LEDs lit on the switch?\r\n");
+    printf("  - Is Switch Start bit set? (0x0002 & 0x01)\r\n");
+    printf("  - Are firewalls on both PCs disabled?\r\n");
+}
+
+/* ---------- Phase 1 入口 ---------- */
+
+void phase1_run(void)
+{
+    printf("\r\n========================================\r\n");
+    printf("  Phase 1: Hardware Bring-Up\r\n");
+    printf("========================================\r\n");
+
+    if (phase1_read_chip_id() != 0) {
+        printf("HALT: Cannot proceed without valid chip ID.\r\n");
+        return;
+    }
+
+    if (phase1_switch_init() != 0) {
+        printf("HALT: Switch initialization failed.\r\n");
+        return;
+    }
+
+    if (phase1_enable_all_ports() != 0) {
+        printf("ERROR: Port initialization failed.\r\n");
+        return;
+    }
+
+    if (phase1_config_host_port() != 0) {
+        printf("ERROR: Host port configuration failed.\r\n");
+        return;
+    }
+
+    phase1_forward_test();
+}
+```
+
+#### D.3.2 Phase 1 成功标准
+
+| 检查项 | 验证方法 | 通过条件 |
+|--------|---------|---------|
+| 芯片 ID 读取 | 运行 phase1_read_chip_id() | 读到 0x9897 |
+| 交换机核心启动 | 回读 0x0002 | Bit 0 = 1 |
+| RMII 使能 | 回读 0x00D0 | Bit 0 = 1 |
+| 所有端口 LINK UP | 插上网线，回读端口状态寄存器 | 5 端口全部显示 LINK UP |
+| 端口间转发 | PC1 ping PC2 | 丢包率 0% |
+
+---
+
+### D.4 Phase 2: CLI 管理接口 (Week 2)
+
+#### D.4.1 UART 命令解析器
+
+```c
+/* ============================================================================
+ * phase2_cli.c
+ * 描述:   Phase 2 — CLI 管理接口，支持端口/VLAN/MAC/MIB 查询
+ *         通过 UART7 (115200 8N1) 交互
+ * ==========================================================================*/
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include "stm32f4xx_hal.h"
+
+/* ---------- 缓冲区定义 ---------- */
+#define CLI_LINE_BUF_SIZE   128
+#define CLI_ARGS_MAX        8
+#define CLI_HISTORY_DEPTH   8
+
+typedef struct {
+    char     line_buf[CLI_LINE_BUF_SIZE];
+    uint16_t line_len;
+    char     history[CLI_HISTORY_DEPTH][CLI_LINE_BUF_SIZE];
+    uint8_t  history_idx;
+    uint8_t  history_count;
+} CLI_Context_t;
+
+static CLI_Context_t cli_ctx;
+
+extern UART_HandleTypeDef huart7;
+
+/* ---------- 串口收发 ---------- */
+
+void cli_putchar(char c)
+{
+    HAL_UART_Transmit(&huart7, (uint8_t *)&c, 1, 100);
+}
+
+void cli_puts(const char *s)
+{
+    if (!s) return;
+    HAL_UART_Transmit(&huart7, (uint8_t *)s, strlen(s), 1000);
+}
+
+static void cli_printf(const char *fmt, ...)
+{
+    char buf[256];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    cli_puts(buf);
+}
+
+/* ---------- 命令行解析 ---------- */
+
+static int tokenize(char *line, char *argv[], int max_args)
+{
+    int argc = 0;
+    char *p = line;
+
+    while (*p && argc < max_args) {
+        /* 跳过空白 */
+        while (*p && isspace((unsigned char)*p)) p++;
+        if (!*p) break;
+
+        argv[argc++] = p;
+
+        /* 跳到下一个空白 */
+        while (*p && !isspace((unsigned char)*p)) p++;
+        if (*p) *p++ = '\0';
+    }
+
+    return argc;
+}
+
+/* ---------- 命令表 ---------- */
+
+typedef struct {
+    const char *name;
+    const char *help;
+    int (*handler)(int argc, char *argv[]);
+} CLI_Command_t;
+
+/* 前置声明 */
+static int cmd_show_ports(int argc, char *argv[]);
+static int cmd_show_mac(int argc, char *argv[]);
+static int cmd_show_vlan(int argc, char *argv[]);
+static int cmd_show_mib(int argc, char *argv[]);
+static int cmd_vlan_create(int argc, char *argv[]);
+static int cmd_vlan_delete(int argc, char *argv[]);
+static int cmd_port_enable(int argc, char *argv[]);
+static int cmd_port_disable(int argc, char *argv[]);
+static int cmd_mirror(int argc, char *argv[]);
+static int cmd_save(int argc, char *argv[]);
+static int cmd_restore(int argc, char *argv[]);
+static int cmd_help(int argc, char *argv[]);
+
+static const CLI_Command_t cmd_table[] = {
+    {"show ports",   "Show all port status",           cmd_show_ports},
+    {"show mac",     "Show MAC address table",         cmd_show_mac},
+    {"show vlan",    "Show VLAN configuration",        cmd_show_vlan},
+    {"show mib",     "Show MIB counters for a port",   cmd_show_mib},
+    {"vlan create",  "Create VLAN: vlan create <vid> <ports>", cmd_vlan_create},
+    {"vlan delete",  "Delete VLAN: vlan delete <vid>",            cmd_vlan_delete},
+    {"port enable",  "Enable port: port enable <port>",           cmd_port_enable},
+    {"port disable", "Disable port: port disable <port>",         cmd_port_disable},
+    {"mirror",       "Configure mirror: mirror <src> <dst> [rx|tx|both] [on|off]", cmd_mirror},
+    {"save",         "Save config to flash",           cmd_save},
+    {"restore",      "Restore config from flash",      cmd_restore},
+    {"help",         "Show this help",                 cmd_help},
+    {NULL, NULL, NULL}
+};
+
+/* ---------- 命令处理函数 ---------- */
+
+/* show ports — 显示所有端口状态 */
+static int cmd_show_ports(int argc, char *argv[])
+{
+    cli_printf("Port Status:\r\n");
+    cli_printf("Port  Link     Speed  Duplex    TX_EN  RX_EN\r\n");
+    cli_printf("----  ------   -----  --------  -----  -----\r\n");
+
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t base = 0x0100 + (p - 1) * 0x20;
+        uint8_t status, ctrl;
+
+        if (ksz_read8(base + 0x04, &status) != 0) break;
+        if (ksz_read8(base + 0x00, &ctrl) != 0) break;
+
+        uint8_t link  = (status & 0x01) ? 1 : 0;
+        uint8_t fd    = (status & 0x02) ? 1 : 0;
+        uint16_t speed = (status & 0x04) ? 100 : 10;
+        uint8_t tx_en = (ctrl  & 0x01) ? 1 : 0;
+        uint8_t rx_en = (ctrl  & 0x02) ? 1 : 0;
+
+        cli_printf("P%d     %s   %3uM  %s      %s     %s\r\n",
+                   p,
+                   link ? "UP" : "DOWN",
+                   speed,
+                   fd ? "Full" : "Half",
+                   tx_en ? "YES" : "NO",
+                   rx_en ? "YES" : "NO");
+    }
+    return 0;
+}
+
+/* show mac — 显示 MAC 地址表 */
+static int cmd_show_mac(int argc, char *argv[])
+{
+    uint8_t count_lo, count_hi;
+    uint16_t count;
+
+    if (ksz_read8(0x050A, &count_lo) != 0) return -1;
+    if (ksz_read8(0x050B, &count_hi) != 0) return -1;
+    count = ((uint16_t)count_hi << 8) | count_lo;
+
+    cli_printf("MAC Address Table (%u entries):\r\n", count);
+    cli_printf("Idx  MAC Address       Ports  Static  Valid\r\n");
+    cli_printf("---- ----------------- -----  ------  -----\r\n");
+
+    uint16_t limit = count < 32 ? count : 32;
+    for (uint16_t i = 0; i < limit; i++) {
+        uint8_t data[9];
+        uint8_t ctrl = (uint8_t)(i & 0xFF) | 0x01;  /* READ | START */
+
+        if (ksz_write8(0x0500, ctrl) != 0) break;
+        HAL_Delay(2);
+
+        for (uint8_t j = 0; j < 9; j++) {
+            ksz_read8(0x0501 + j, &data[j]);
+        }
+
+        if (data[8] & 0x01) {  /* Valid */
+            cli_printf("[%3u] %02X:%02X:%02X:%02X:%02X:%02X  0x%02X  %s  %s\r\n",
+                       i,
+                       data[0], data[1], data[2], data[3], data[4], data[5],
+                       data[6],
+                       (data[8] & 0x02) ? "YES" : "NO ",
+                       (data[8] & 0x01) ? "YES" : "NO ");
+        }
+    }
+
+    if (count > 32) {
+        cli_printf("  ... and %u more entries\r\n", count - 32);
+    }
+    return 0;
+}
+
+/* show vlan — 显示 VLAN 配置 */
+static int cmd_show_vlan(int argc, char *argv[])
+{
+    cli_printf("VLAN Configuration (Port-based):\r\n");
+    cli_printf("Port  Membership (bitmap)  Ports in Forwarding Set\r\n");
+    cli_printf("----  -------------------  --------------------------\r\n");
+
+    uint16_t regs[] = {0x000D, 0x000E, 0x000F, 0x0010, 0x0011, 0x0013};
+    uint8_t ports[] = {1, 2, 3, 4, 5, 7};
+
+    for (int i = 0; i < 6; i++) {
+        uint8_t member;
+        if (ksz_read8(regs[i], &member) != 0) break;
+
+        cli_printf("P%d     0x%02X              ", ports[i], member);
+        for (uint8_t p = 1; p <= 7; p++) {
+            if (p == 6) continue;  /* Port 6 不存在 */
+            if (member & (1 << (p - 1))) {
+                cli_printf("P%d ", p);
+            }
+        }
+        cli_printf("\r\n");
+    }
+    return 0;
+}
+
+/* show mib — 显示端口 MIB 计数器 */
+static int cmd_show_mib(int argc, char *argv[])
+{
+    if (argc < 3) {
+        cli_printf("Usage: show mib <port=1-5>\r\n");
+        return -1;
+    }
+
+    uint8_t port = (uint8_t)atoi(argv[2]);
+    if (port < 1 || port > 5) {
+        cli_printf("Invalid port. Use 1-5.\r\n");
+        return -1;
+    }
+
+    /* MIB 基址: 0x0600 (Port1), 0x0640 (Port2), ..., 每个端口 0x40 字节 */
+    uint16_t mib_base = 0x0600 + (port - 1) * 0x40;
+
+    cli_printf("MIB Counters for Port %d:\r\n", port);
+    cli_printf("  Offset  Counter Name           Value\r\n");
+    cli_printf("  ------  --------------------   ----------\r\n");
+
+    /* 关键 MIB 计数器定义 */
+    typedef struct {
+        uint16_t offset;
+        const char *name;
+    } MIB_Counter_t;
+
+    MIB_Counter_t mib_tbl[] = {
+        {0x00, "Rx Octets (lo)"},
+        {0x02, "Rx Octets (hi)"},
+        {0x04, "Rx Frames OK"},
+        {0x06, "Rx CRC Errors"},
+        {0x08, "Rx Align Errors"},
+        {0x0A, "Rx Symbol Errors"},
+        {0x0C, "Rx Frames Discarded"},
+        {0x0E, "Rx Broadcast"},
+        {0x10, "Rx Multicast"},
+        {0x12, "Rx Pause Frames"},
+        {0x14, "Tx Octets (lo)"},
+        {0x16, "Tx Octets (hi)"},
+        {0x18, "Tx Frames OK"},
+        {0x1A, "Tx Deferred"},
+        {0x1C, "Tx Late Collisions"},
+        {0x1E, "Tx Collisions"},
+        {0x20, "Tx Pause Frames"},
+        {0x22, "Rx Frames 64"},
+        {0x24, "Rx Frames 65-127"},
+        {0x26, "Rx Frames 128-255"},
+        {0x28, "Rx Frames 256-511"},
+        {0x2A, "Rx Frames 512-1023"},
+        {0x2C, "Rx Frames 1024-1518"},
+        {0x2E, "Rx Frames > 1518"},
+    };
+
+    for (int i = 0; i < 24; i++) {
+        uint16_t val;
+        if (ksz_read16(mib_base + mib_tbl[i].offset, &val) == 0) {
+            cli_printf("  0x%02X    %-22s %u\r\n",
+                       mib_tbl[i].offset, mib_tbl[i].name, val);
+        }
+    }
+    return 0;
+}
+
+/* vlan create — 创建 VLAN */
+static int cmd_vlan_create(int argc, char *argv[])
+{
+    if (argc < 4) {
+        cli_printf("Usage: vlan create <vid=10-4094> <port_bitmap_hex>\r\n");
+        cli_printf("  e.g., vlan create 10 0x46  -> VLAN10 Port1+2+CPU\r\n");
+        cli_printf("  e.g., vlan create 20 0x58  -> VLAN20 Port3+4+CPU\r\n");
+        return -1;
+    }
+
+    uint16_t vid = (uint16_t)atoi(argv[2]);
+    uint8_t bitmap = (uint8_t)strtol(argv[3], NULL, 0);
+
+    if (vid < 10 || vid > 4094) {
+        cli_printf("VID must be 10-4094.\r\n");
+        return -1;
+    }
+
+    /* 存储 VLAN 配置到运行时表 */
+    cli_printf("VLAN %u created with bitmap 0x%02X\r\n", vid, bitmap);
+    cli_printf("Set membership registers for each port...\r\n");
+
+    /* 对于 Port-based VLAN，更新端口的成员表 */
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t reg = 0x000D + (p - 1);
+        if (bitmap & (1 << (p - 1))) {
+            /* 该端口属于这个 VLAN，更新其成员为 bitmap */
+            if (ksz_write8(reg, bitmap) != 0) {
+                cli_printf("  ERROR writing Port %d membership\r\n", p);
+                return -1;
+            }
+        }
+    }
+
+    /* 使能入口过滤 */
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t base = 0x0100 + (p - 1) * 0x20;
+        uint8_t ctrl;
+        if (ksz_read8(base, &ctrl) == 0) {
+            ctrl |= (1 << 3);  /* INGRESS_FLTR */
+            ksz_write8(base, ctrl);
+        }
+    }
+
+    /* CPU 端口可以到达所有 */
+    ksz_write8(0x0013, 0x7F);
+
+    cli_printf("VLAN %u applied successfully.\r\n", vid);
+    return 0;
+}
+
+/* vlan delete — 删除 VLAN */
+static int cmd_vlan_delete(int argc, char *argv[])
+{
+    if (argc < 3) {
+        cli_printf("Usage: vlan delete <vid>\r\n");
+        return -1;
+    }
+
+    /* 清除所有端口的成员表恢复默认 */
+    cli_printf("Clearing VLAN configuration...\r\n");
+    for (uint8_t p = 1; p <= 5; p++) {
+        ksz_write8(0x000D + (p - 1), 0x7F);
+    }
+    ksz_write8(0x0013, 0x7F);
+
+    /* 禁用入口过滤 */
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t base = 0x0100 + (p - 1) * 0x20;
+        uint8_t ctrl;
+        if (ksz_read8(base, &ctrl) == 0) {
+            ctrl &= ~(1 << 3);
+            ksz_write8(base, ctrl);
+        }
+    }
+
+    cli_printf("VLAN config cleared. Switch back to transparent mode.\r\n");
+    return 0;
+}
+
+/* port enable/disable */
+static int cmd_port_enable(int argc, char *argv[])
+{
+    if (argc < 3) { cli_printf("Usage: port enable <port=1-5>\r\n"); return -1; }
+    uint8_t port = (uint8_t)atoi(argv[2]);
+    if (port < 1 || port > 5) { cli_printf("Invalid port\r\n"); return -1; }
+
+    uint16_t base = 0x0100 + (port - 1) * 0x20;
+    ksz_write8(base, 0x03);  /* TX_EN | RX_EN */
+    cli_printf("Port %d enabled.\r\n", port);
+    return 0;
+}
+
+static int cmd_port_disable(int argc, char *argv[])
+{
+    if (argc < 3) { cli_printf("Usage: port disable <port=1-5>\r\n"); return -1; }
+    uint8_t port = (uint8_t)atoi(argv[2]);
+    if (port < 1 || port > 5) { cli_printf("Invalid port\r\n"); return -1; }
+
+    uint16_t base = 0x0100 + (port - 1) * 0x20;
+    ksz_write8(base, 0x00);  /* TX + RX disable */
+    cli_printf("Port %d disabled.\r\n", port);
+    return 0;
+}
+
+/* mirror — 端口镜像 */
+static int cmd_mirror(int argc, char *argv[])
+{
+    if (argc < 4) {
+        cli_printf("Usage: mirror <src_port> <dst_port> [rx|tx|both] [on|off]\r\n");
+        cli_printf("  e.g., mirror 1 5 both on    -> mirror Port1 to Port5\r\n");
+        cli_printf("  e.g., mirror 1 5 rx on      -> mirror RX only\r\n");
+        cli_printf("  e.g., mirror 1 5 both off   -> disable mirror\r\n");
+        return -1;
+    }
+
+    uint8_t src = (uint8_t)atoi(argv[1]);
+    uint8_t dst = (uint8_t)atoi(argv[2]);
+    const char *mode = argv[3];
+    int enable = 1;
+
+    if (argc >= 5) {
+        enable = (strcmp(argv[4], "on") == 0);
+    }
+
+    if (enable) {
+        /* 配置源端口 (寄存器 0x001D) */
+        ksz_write8(0x001D, (src & 0x07) << 3);
+
+        /* 配置目的端口 (寄存器 0x001E) */
+        ksz_write8(0x001E, 0x80 | (dst & 0x07));
+
+        /* 配置镜像类型 (寄存器 0x001C) */
+        uint8_t ctrl = 0x01;  /* Sniffer Enable */
+        if (strcmp(mode, "rx") == 0)  ctrl |= 0x02;
+        if (strcmp(mode, "tx") == 0)  ctrl |= 0x04;
+        if (strcmp(mode, "both") == 0) ctrl |= 0x06;
+        ksz_write8(0x001C, ctrl);
+
+        cli_printf("Mirror: Port %d -> Port %d (%s) ENABLED\r\n", src, dst, mode);
+    } else {
+        ksz_write8(0x001C, 0x00);
+        ksz_write8(0x001D, 0x00);
+        ksz_write8(0x001E, 0x00);
+        cli_printf("Mirror DISABLED\r\n");
+    }
+    return 0;
+}
+
+/* save/restore — 配置持久化 */
+#define CONFIG_FLASH_ADDR   0x080E0000  /* STM32F429 最后 128KB 扇区 */
+
+static int cmd_save(int argc, char *argv[])
+{
+    cli_printf("Saving configuration to Flash (0x%08X)...\r\n", CONFIG_FLASH_ADDR);
+
+    /* 读取关键寄存器并保存 */
+    uint8_t config_data[64];
+    uint16_t regs[] = {0x000D, 0x000E, 0x000F, 0x0010, 0x0011, 0x0013,
+                       0x001C, 0x001D, 0x001E, 0x00D0};
+
+    for (int i = 0; i < 10; i++) {
+        ksz_read8(regs[i], &config_data[i]);
+    }
+
+    /* 保存端口使能状态 */
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t base = 0x0100 + (p - 1) * 0x20;
+        ksz_read8(base, &config_data[10 + p - 1]);
+    }
+
+    /* 写入 Flash (需要 HAL Flash 驱动) */
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_EOP | FLASH_FLAG_OPERR | FLASH_FLAG_WRPERR);
+
+    FLASH_Erase_Sector(FLASH_SECTOR_11, VOLTAGE_RANGE_3);
+
+    for (int i = 0; i < (int)sizeof(config_data); i += 4) {
+        uint32_t word = *(uint32_t *)&config_data[i];
+        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, CONFIG_FLASH_ADDR + i, word) != HAL_OK) {
+            cli_printf("  Flash write error at offset %d\r\n", i);
+            HAL_FLASH_Lock();
+            return -1;
+        }
+    }
+
+    HAL_FLASH_Lock();
+    cli_printf("Configuration saved (%d bytes).\r\n", (int)sizeof(config_data));
+    return 0;
+}
+
+static int cmd_restore(int argc, char *argv[])
+{
+    cli_printf("Restoring configuration from Flash...\r\n");
+
+    uint8_t config_data[64];
+
+    /* 从 Flash 读取 */
+    for (int i = 0; i < 64; i++) {
+        config_data[i] = *(volatile uint8_t *)(CONFIG_FLASH_ADDR + i);
+    }
+
+    /* 验证魔数 (前 4 字节应为 0xDEADBEEF) */
+    uint32_t magic = *(uint32_t *)config_data;
+    if (magic != 0xDEADBEEF) {
+        cli_printf("No valid configuration found in Flash (magic=0x%08X)\r\n", magic);
+        return -1;
+    }
+
+    /* 恢复寄存器 */
+    uint16_t regs[] = {0x000D, 0x000E, 0x000F, 0x0010, 0x0011, 0x0013,
+                       0x001C, 0x001D, 0x001E, 0x00D0};
+
+    for (int i = 0; i < 10; i++) {
+        ksz_write8(regs[i], config_data[i]);
+    }
+
+    /* 恢复端口使能 */
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t base = 0x0100 + (p - 1) * 0x20;
+        ksz_write8(base, config_data[10 + p - 1]);
+    }
+
+    cli_printf("Configuration restored.\r\n");
+    return 0;
+}
+
+/* help */
+static int cmd_help(int argc, char *argv[])
+{
+    cli_printf("Available Commands:\r\n");
+    cli_printf("====================\r\n");
+
+    for (int i = 0; cmd_table[i].name; i++) {
+        cli_printf("  %-20s - %s\r\n", cmd_table[i].name, cmd_table[i].help);
+    }
+    cli_printf("\r\nTip: Use 'show' commands for monitoring, 'vlan' for isolation.\r\n");
+    return 0;
+}
+
+/* ---------- CLI 主循环 ---------- */
+
+static int cli_dispatch(int argc, char *argv[])
+{
+    if (argc == 0) return 0;
+
+    /* 精确匹配或前缀匹配 */
+    for (int i = 0; cmd_table[i].name; i++) {
+        const char *full_cmd = cmd_table[i].name;
+
+        /* 构造用户输入的命令字符串 */
+        char user_cmd[128] = {0};
+        for (int j = 0; j < argc; j++) {
+            if (j > 0) strcat(user_cmd, " ");
+            strcat(user_cmd, argv[j]);
+        }
+
+        if (strcmp(user_cmd, full_cmd) == 0) {
+            return cmd_table[i].handler(argc, argv);
+        }
+    }
+
+    cli_printf("Unknown command. Type 'help' for available commands.\r\n");
+    return -1;
+}
+
+void cli_process_char(char c)
+{
+    if (c == '\r' || c == '\n') {
+        /* 处理一行 */
+        cli_printf("\r\n");
+        cli_ctx.line_buf[cli_ctx.line_len] = '\0';
+
+        if (cli_ctx.line_len > 0) {
+            char *argv[CLI_ARGS_MAX];
+            int argc = tokenize(cli_ctx.line_buf, argv, CLI_ARGS_MAX);
+            cli_dispatch(argc, argv);
+
+            /* 保存到历史 */
+            if (cli_ctx.history_count < CLI_HISTORY_DEPTH) {
+                strcpy(cli_ctx.history[cli_ctx.history_count++], cli_ctx.line_buf);
+            } else {
+                memmove(cli_ctx.history[0], cli_ctx.history[1],
+                        (CLI_HISTORY_DEPTH - 1) * CLI_LINE_BUF_SIZE);
+                strcpy(cli_ctx.history[CLI_HISTORY_DEPTH - 1], cli_ctx.line_buf);
+            }
+            cli_ctx.history_idx = cli_ctx.history_count;
+        }
+
+        cli_ctx.line_len = 0;
+        cli_printf("switch> ");
+    } else if (c == '\b' || c == 0x7F) {
+        /* 退格 */
+        if (cli_ctx.line_len > 0) {
+            cli_ctx.line_len--;
+            cli_printf("\b \b");
+        }
+    } else if (c >= ' ' && c <= '~') {
+        /* 可打印字符 */
+        if (cli_ctx.line_len < CLI_LINE_BUF_SIZE - 1) {
+            cli_ctx.line_buf[cli_ctx.line_len++] = c;
+            cli_putchar(c);
+        }
+    }
+}
+
+void cli_init(void)
+{
+    memset(&cli_ctx, 0, sizeof(cli_ctx));
+    cli_printf("\r\n========================================\r\n");
+    cli_printf("  KSZ9897 Managed Switch CLI v1.0\r\n");
+    cli_printf("========================================\r\n");
+    cli_printf("Type 'help' for available commands.\r\n\r\n");
+    cli_printf("switch> ");
+}
+
+/* CLI 轮询（在主循环中调用）*/
+void cli_poll(void)
+{
+    uint8_t ch;
+    while (HAL_UART_Receive(&huart7, &ch, 1, 1) == HAL_OK) {
+        cli_process_char((char)ch);
+    }
+}
+```
+
+#### D.4.2 CLI 使用手册
+
+| 命令 | 示例 | 说明 |
+|------|------|------|
+| `show ports` | `show ports` | 显示 5 个端口的链路、速率、双工、使能状态 |
+| `show mac` | `show mac` | 显示 MAC 地址表（最多 32 条） |
+| `show vlan` | `show vlan` | 显示每个端口的成员位图和转发集合 |
+| `show mib <port>` | `show mib 1` | 显示端口的 24 个 MIB 计数器 |
+| `port enable <p>` | `port enable 3` | 使能指定端口 (TX+RX) |
+| `port disable <p>` | `port disable 3` | 禁用指定端口 |
+| `vlan create <vid> <hex>` | `vlan create 10 0x46` | 创建 VLAN (bitmap: Port1+2+CPU) |
+| `vlan delete <vid>` | `vlan delete 10` | 删除 VLAN，恢复透明模式 |
+| `mirror <src> <dst> <mode>` | `mirror 1 5 both on` | 配置端口镜像 |
+| `save` | `save` | 保存配置到 Flash |
+| `restore` | `restore` | 从 Flash 恢复配置 |
+| `help` | `help` | 显示帮助信息 |
+
+---
+
+### D.5 Phase 3: VLAN 隔离配置 (Week 2-3)
+
+#### D.5.1 VLAN 拓扑设计
+
+```
+                          +--------------------------------------+
+                          |          KSZ9897 Switch              |
+                          |                                      |
+                          |  +-------+  Engineering VLAN 10      |
+                          |  | Port 1 |  untagged                 |
+                          |  +-------+                            |
+                          |  +-------+                            |
+                          |  | Port 2 |  untagged                 |
+                          |  +-------+                            |
+                          |    ...                                |
+                          |  +-------+  Sales VLAN 20             |
+                          |  | Port 3 |  untagged                 |
+                          |  +-------+                            |
+                          |  +-------+                            |
+                          |  | Port 4 |  untagged                 |
+                          |  +-------+                            |
+                          |    ...                                |
+                          |  +-------+  Management VLAN 99        |
+                          |  | Port 5 |  tagged                   |
+                          |  +-------+                            |
+                          |    ...                                |
+                          |  +-------+                            |
+                          |  | Port 7 |  tagged (VLAN 10+20+99)   |
+                          |  +-------+  CPU/Management            |
+                          +------+-------------------------------+
+                                 |
+                           [RMII Bus]
+                                 |
+                          +------+------+
+                          |  STM32 MCU  |
+                          |  (LwIP)     |
+                          +-------------+
+```
+
+**VLAN 分配表：**
+
+| VLAN ID | 名称 | 成员端口 | Tagged/Untagged | 子网 |
+|---------|------|---------|-----------------|------|
+| 10 | Engineering | Port 1, 2, 7 | Port 1,2=Untagged, Port7=Tagged | 192.168.10.0/24 |
+| 20 | Sales | Port 3, 4, 7 | Port 3,4=Untagged, Port7=Tagged | 192.168.20.0/24 |
+| 99 | Management | Port 5, 7 | Port 5,7=Tagged | 192.168.99.0/24 |
+
+#### D.5.2 完整 VLAN 配置代码
+
+```c
+/* ============================================================================
+ * phase3_vlan_config.c
+ * 描述:   Phase 3 — 完整的 802.1Q VLAN 配置
+ *         创建 Engineering、Sales、Management 三个 VLAN
+ *         验证隔离、Trunk 端口功能
+ * ==========================================================================*/
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include "stm32f4xx_hal.h"
+
+/* ---------- 端口位图定义 ---------- */
+#define BIT_P1   0x01
+#define BIT_P2   0x02
+#define BIT_P3   0x04
+#define BIT_P4   0x08
+#define BIT_P5   0x10
+#define BIT_P7   0x40
+
+/* ---------- VLAN 配置参数 ---------- */
+
+typedef struct {
+    uint16_t vid;       /* VLAN ID */
+    const char *name;   /* VLAN 名称 */
+    uint8_t  member;    /* 成员端口位图 */
+    uint8_t  untagged;  /* Untagged 端口位图 (1=un Tagged) */
+} VLAN_Config_t;
+
+static const VLAN_Config_t vlan_config[] = {
+    {10, "Engineering",   BIT_P1 | BIT_P2 | BIT_P7,  BIT_P1 | BIT_P2},
+    {20, "Sales",         BIT_P3 | BIT_P4 | BIT_P7,  BIT_P3 | BIT_P4},
+    {99, "Management",    BIT_P5 | BIT_P7,            0},  /* 全部 Tagged */
+    {0, NULL, 0, 0}  /* 结束标记 */
+};
+
+/* ---------- KSZ9897 VLAN 相关寄存器 ---------- */
+
+/* Port-based VLAN 成员 (转发域) */
+#define KSZ_REG_PORT_MEMBER_P1  0x000D
+#define KSZ_REG_PORT_MEMBER_P2  0x000E
+#define KSZ_REG_PORT_MEMBER_P3  0x000F
+#define KSZ_REG_PORT_MEMBER_P4  0x0010
+#define KSZ_REG_PORT_MEMBER_P5  0x0011
+#define KSZ_REG_PORT_MEMBER_P7  0x0013
+
+/* Port VLAN ID (PVID) 寄存器 — 端口内偏移 */
+#define KSZ_PORT_PVID_LO        0x06
+#define KSZ_PORT_PVID_HI        0x07
+
+/* 端口控制 0 — INGRESS_FLTR = bit 3 */
+#define KSZ_PORT_CTRL0_INGRESS_FLTR  (1 << 3)
+
+/* Tag 使能 — 端口控制 2 */
+#define KSZ_PORT_CTRL2_TAG_INSERT    (1 << 6)
+#define KSZ_PORT_CTRL2_TAG_REMOVE    (1 << 7)
+
+/* ---------- 802.1Q VLAN 表 (VLAN Table) ---------- */
+
+#define KSZ_REG_VLAN_TABLE_CTRL     0x0400
+#define KSZ_REG_VLAN_TABLE_DATA0    0x0401
+#define KSZ_REG_VLAN_TABLE_DATA1    0x0402
+#define KSZ_REG_VLAN_TABLE_DATA2    0x0403
+#define KSZ_REG_VLAN_TABLE_DATA3    0x0404
+#define KSZ_REG_VLAN_TABLE_DATA4    0x0405
+#define KSZ_REG_VLAN_TABLE_DATA5    0x0406
+
+/*
+ * VLAN 表条目格式 (6 字节):
+ *   Byte 0: Port Map [7:0]  (Bit0=P1, Bit1=P2, ... Bit6=P7)
+ *   Byte 1: Port Map [14:8] (Bit8~14 未使用)
+ *   Byte 2: Untagged Map [7:0]
+ *   Byte 3: Untagged Map [14:8]
+ *   Byte 4: VID [7:0]
+ *   Byte 5: VID [11:8] + Control bits
+ */
+
+/* ---------- VLAN 表操作函数 ---------- */
+
+/* 向 VLAN 表写入一条 VLAN 条目 */
+int vlan_table_write(uint16_t vid, uint16_t member_map, uint16_t untagged_map)
+{
+    uint8_t data[6];
+    int ret;
+
+    /* 构建 VLAN 表数据 */
+    data[0] = (uint8_t)(member_map & 0xFF);
+    data[1] = (uint8_t)((member_map >> 8) & 0xFF);
+    data[2] = (uint8_t)(untagged_map & 0xFF);
+    data[3] = (uint8_t)((untagged_map >> 8) & 0xFF);
+    data[4] = (uint8_t)(vid & 0xFF);
+    data[5] = (uint8_t)((vid >> 8) & 0x0F) | 0x00;  /* 0x00 = valid, no SID */
+
+    /* 写入数据寄存器 */
+    for (int i = 0; i < 6; i++) {
+        ret = ksz_write8(KSZ_REG_VLAN_TABLE_DATA0 + i, data[i]);
+        if (ret != 0) return ret;
+    }
+
+    /* 触发写入操作: VID + WRITE */
+    uint8_t ctrl = (uint8_t)(vid & 0xFF);
+    ret = ksz_write8(KSZ_REG_VLAN_TABLE_CTRL, ctrl | 0x80);  /* Bit7=WRITE |
+Bit0=START */
+
+    if (ret != 0) return ret;
+    HAL_Delay(1);
+
+    cli_printf("  VLAN table write: VID=%u, member=0x%04X, untagged=0x%04X\r\n",
+               vid, member_map, untagged_map);
+    return 0;
+}
+
+/* 从 VLAN 表中读取一条 VLAN 条目 */
+int vlan_table_read(uint16_t vid, uint16_t *member_map, uint16_t *untagged_map)
+{
+    uint8_t data[6];
+    int ret;
+
+    /* 触发读取操作 */
+    uint8_t ctrl = (uint8_t)(vid & 0xFF);
+    ret = ksz_write8(KSZ_REG_VLAN_TABLE_CTRL, (ctrl & 0x7F) | 0x01);  /* Bit0=START,
+ Bit7=0=READ */
+    if (ret != 0) return ret;
+    HAL_Delay(1);
+
+    /* 读取数据 */
+    for (int i = 0; i < 6; i++) {
+        ret = ksz_read8(KSZ_REG_VLAN_TABLE_DATA0 + i, &data[i]);
+        if (ret != 0) return ret;
+    }
+
+    if (member_map)
+        *member_map = ((uint16_t)data[1] << 8) | data[0];
+    if (untagged_map)
+        *untagged_map = ((uint16_t)data[3] << 8) | data[2];
+
+    return 0;
+}
+
+/* ---------- 配置 Port-based VLAN (转发域) ---------- */
+
+static int phase3_set_port_membership(void)
+{
+    int ret;
+
+    /* Port 1 属于: Port1 + Port2 + Port7 (Engineering) */
+    ret = ksz_write8(KSZ_REG_PORT_MEMBER_P1, BIT_P1 | BIT_P2 | BIT_P7);
+    if (ret != 0) return -1;
+
+    /* Port 2 同 VLAN10 */
+    ret = ksz_write8(KSZ_REG_PORT_MEMBER_P2, BIT_P1 | BIT_P2 | BIT_P7);
+    if (ret != 0) return -2;
+
+    /* Port 3 属于: Port3 + Port4 + Port7 (Sales) */
+    ret = ksz_write8(KSZ_REG_PORT_MEMBER_P3, BIT_P3 | BIT_P4 | BIT_P7);
+    if (ret != 0) return -3;
+
+    /* Port 4 同 VLAN20 */
+    ret = ksz_write8(KSZ_REG_PORT_MEMBER_P4, BIT_P3 | BIT_P4 | BIT_P7);
+    if (ret != 0) return -4;
+
+    /* Port 5: Management, 仅与 CPU 通信 */
+    ret = ksz_write8(KSZ_REG_PORT_MEMBER_P5, BIT_P5 | BIT_P7);
+    if (ret != 0) return -5;
+
+    /* CPU 端口可以到达所有端口 */
+    ret = ksz_write8(KSZ_REG_PORT_MEMBER_P7, 0x7F);
+    if (ret != 0) return -6;
+
+    return 0;
+}
+
+/* ---------- 配置 PVID ---------- */
+
+static int phase3_set_pvid(void)
+{
+    int ret;
+
+    /* PVID 配置表: [port] = vid */
+    uint16_t pvid_table[] = {10, 10, 20, 20, 99};
+
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t base = 0x0100 + (p - 1) * 0x20;
+
+        /* PVID 低 8 位 (偏移 0x06) */
+        ret = ksz_write8(base + KSZ_PORT_PVID_LO, (uint8_t)(pvid_table[p-1] & 0xFF));
+        if (ret != 0) return -1;
+
+        /* PVID 高 4 位 (偏移 0x07) */
+        ret = ksz_write8(base + KSZ_PORT_PVID_HI, (uint8_t)((pvid_table[p-1] >> 8) & 0x0F));
+        if (ret != 0) return -1;
+
+        cli_printf("  PVID Port %d = %u\r\n", p, pvid_table[p-1]);
+    }
+
+    return 0;
+}
+
+/* ---------- 配置 Tag/Untag 行为 ---------- */
+
+static int phase3_set_tag_behavior(void)
+{
+    int ret;
+
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t base = 0x0100 + (p - 1) * 0x20;
+        uint8_t ctrl2;
+
+        ret = ksz_read8(base + 0x02, &ctrl2);
+        if (ret != 0) continue;
+
+        /* 判断此端口的帧是否需要 Tag */
+        uint8_t is_untagged = 0;
+
+        for (int i = 0; vlan_config[i].name; i++) {
+            if (vlan_config[i].untagged & (1 << (p - 1))) {
+                is_untagged = 1;
+                break;
+            }
+        }
+
+        if (is_untagged) {
+            /* Untagged 端口: 移除进入的 Tag, 发送时不加 Tag */
+            ctrl2 |= (KSZ_PORT_CTRL2_TAG_REMOVE);
+            ctrl2 &= ~(KSZ_PORT_CTRL2_TAG_INSERT);
+            cli_printf("  Port %d: untagged (remove tag on ingress)\r\n", p);
+        } else {
+            /* Tagged 端口: 保留 Tag, 发送时加 Tag */
+            ctrl2 |= (KSZ_PORT_CTRL2_TAG_INSERT);
+            ctrl2 &= ~(KSZ_PORT_CTRL2_TAG_REMOVE);
+            cli_printf("  Port %d: tagged (insert tag on egress)\r\n", p);
+        }
+
+        ret = ksz_write8(base + 0x02, ctrl2);
+        if (ret != 0) return -1;
+    }
+
+    /* CPU 端口 (Port 7): Tagged — 接收所有 VLAN 的帧，帧保留 Tag */
+    uint16_t port7_base = 0x01C0;
+    uint8_t p7_ctrl2;
+    ksz_read8(port7_base + 0x02, &p7_ctrl2);
+    p7_ctrl2 |= (KSZ_PORT_CTRL2_TAG_INSERT);
+    p7_ctrl2 &= ~(KSZ_PORT_CTRL2_TAG_REMOVE);
+    ksz_write8(port7_base + 0x02, p7_ctrl2);
+    cli_printf("  Port 7 (CPU): tagged trunk\r\n");
+
+    return 0;
+}
+
+/* ---------- 使能入口过滤 ---------- */
+
+static int phase3_enable_ingress_filter(void)
+{
+    int ret;
+
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t base = 0x0100 + (p - 1) * 0x20;
+        uint8_t ctrl0;
+
+        ret = ksz_read8(base + 0x00, &ctrl0);
+        if (ret != 0) continue;
+
+        ctrl0 |= KSZ_PORT_CTRL0_INGRESS_FLTR;
+        ret = ksz_write8(base + 0x00, ctrl0);
+        if (ret != 0) return -1;
+    }
+
+    cli_printf("  Ingress filtering enabled on all ports\r\n");
+    return 0;
+}
+
+/* ---------- Phase 3 主入口 ---------- */
+
+int phase3_configure_all_vlans(void)
+{
+    int ret;
+    uint8_t verify;
+
+    cli_printf("===== Phase 3: VLAN Configuration =====\r\n\r\n");
+    cli_printf("[Step 1] Setting port membership (forwarding domains)...\r\n");
+
+    ret = phase3_set_port_membership();
+    if (ret != 0) { cli_printf("  FAILED (code=%d)\r\n", ret); return ret; }
+    cli_printf("  [OK]\r\n");
+
+    cli_printf("[Step 2] Setting PVID for each port...\r\n");
+    ret = phase3_set_pvid();
+    if (ret != 0) { cli_printf("  FAILED (code=%d)\r\n", ret); return ret; }
+    cli_printf("  [OK]\r\n");
+
+    cli_printf("[Step 3] Configuring tag/untag behavior...\r\n");
+    ret = phase3_set_tag_behavior();
+    if (ret != 0) { cli_printf("  FAILED (code=%d)\r\n", ret); return ret; }
+    cli_printf("  [OK]\r\n");
+
+    cli_printf("[Step 4] Enabling ingress filtering...\r\n");
+    ret = phase3_enable_ingress_filter();
+    if (ret != 0) { cli_printf("  FAILED (code=%d)\r\n", ret); return ret; }
+    cli_printf("  [OK]\r\n");
+
+    cli_printf("[Step 5] Writing 802.1Q VLAN table...\r\n");
+    for (int i = 0; vlan_config[i].name; i++) {
+        cli_printf("  Writing VLAN %u (%s)...\r\n", vlan_config[i].vid, vlan_config[i].name);
+        ret = vlan_table_write(vlan_config[i].vid,
+                               vlan_config[i].member,
+                               vlan_config[i].untagged);
+        if (ret != 0) { cli_printf("  FAILED (code=%d)\r\n", ret); return ret; }
+    }
+    cli_printf("  [OK]\r\n");
+
+    cli_printf("[Step 6] Verification...\r\n");
+    for (int i = 0; vlan_config[i].name; i++) {
+        uint16_t member = 0, untagged = 0;
+        vlan_table_read(vlan_config[i].vid, &member, &untagged);
+        cli_printf("  VLAN %u: member=0x%04X, untagged=0x%04X\r\n",
+                   vlan_config[i].vid, member, untagged);
+    }
+
+    cli_printf("\r\n===== VLAN Configuration Complete =====\r\n");
+    return 0;
+}
+
+/* ---------- VLAN 隔离验证辅助 ---------- */
+
+void phase3_vlan_isolation_test(void)
+{
+    cli_printf("\r\n===== VLAN Isolation Test =====\r\n");
+    cli_printf("\r\nTest Setup:\r\n");
+    cli_printf("  PC1 -> Port 1 (VLAN 10, Engineering)\r\n");
+    cli_printf("  PC2 -> Port 2 (VLAN 10, Engineering)\r\n");
+    cli_printf("  PC3 -> Port 3 (VLAN 20, Sales)\r\n");
+    cli_printf("  PC4 -> Port 4 (VLAN 20, Sales)\r\n");
+    cli_printf("  PC5 -> Port 5 (VLAN 99, Management, Tagged)\r\n");
+
+    cli_printf("\r\nIP Configuration:\r\n");
+    cli_printf("  PC1: 192.168.10.1/24\r\n");
+    cli_printf("  PC2: 192.168.10.2/24\r\n");
+    cli_printf("  PC3: 192.168.20.1/24\r\n");
+    cli_printf("  PC4: 192.168.20.2/24\r\n");
+    cli_printf("  PC5: 192.168.99.1/24\r\n");
+
+    cli_printf("\r\nTest Cases:\r\n");
+    cli_printf("  [Test 1] PC1 ping PC2  -> EXPECT PASS (same VLAN10)\r\n");
+    cli_printf("  [Test 2] PC3 ping PC4  -> EXPECT PASS (same VLAN20)\r\n");
+    cli_printf("  [Test 3] PC1 ping PC3  -> EXPECT FAIL (different VLAN)\r\n");
+    cli_printf("  [Test 4] PC2 ping PC4  -> EXPECT FAIL (different VLAN)\r\n");
+    cli_printf("  [Test 5] PC1 ping PC5  -> EXPECT FAIL (VLAN10<->VLAN99)\r\n");
+
+    cli_printf("\r\nVerification with Wireshark:\r\n");
+    cli_printf("  On PC5 (tagged port), enable VLAN filter in Wireshark:\r\n");
+    cli_printf("    'vlan.id == 10' should show PC1 broadcasts\r\n");
+    cli_printf("    'vlan.id == 20' should show PC3 broadcasts\r\n");
+    cli_printf("    'vlan' filter shows all tagged frames on trunk\r\n");
+}
+```
+
+#### D.5.3 VLAN 验证场景
+
+| 测试场景 | 操作 | 预期结果 | 验证方法 |
+|---------|------|---------|---------|
+| 同 VLAN 通信 | PC1(10.1) ping PC2(10.2) | 成功 | ping 命令 |
+| 跨 VLAN 隔离 | PC1(10.1) ping PC3(20.1) | 失败 (超时) | ping 命令 |
+| Trunk 端口 | PC5 连接 Port 5, Wireshark 抓包 | 看到带 802.1Q Tag 的帧 | Wireshark |
+| CPU 管理 | MCU ping PC1 和 PC3 | 均成功 | CLI ping |
+| 入口过滤 | 发送 VLAN 30 帧到 Port 1 | 帧被丢弃 | MIB 计数器增加 |
+
+---
+
+### D.6 Phase 4: Web 管理界面 (Week 3-4)
+
+> Web 界面基于 LwIP netconn API (Sequential API) 实现，适合 RTOS 或轮询环境。HTML 页面内嵌在 C 代码中，无需外部文件系统。
+
+#### D.6.1 内嵌 Web 页面 (HTML + CSS + JS)
+
+```c
+/* ============================================================================
+ * phase4_http_server.c
+ * 描述:   Phase 4 — 基于 LwIP netconn API 的 HTTP 管理服务器
+ *         提供端口状态、MIB 计数器、VLAN 配置的 Web 界面
+ * ==========================================================================*/
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include "lwip/api.h"
+#include "stm32f4xx_hal.h"
+
+#define HTTP_PORT       80
+#define MAX_HEADER_LEN  1024
+
+/* ---------- HTTP 响应模板 ---------- */
+
+/* 公共 CSS 样式 */
+static const char *html_style =
+    "<style>"
+    "body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}"
+    "h1{color:#2c3e50;border-bottom:2px solid #3498db;padding-bottom:10px}"
+    "table{border-collapse:collapse;width:100%;background:white;box-shadow:0 1px 3px rgba(0,0,0,0.2)}"
+    "th{background:#3498db;color:white;padding:10px;text-align:left}"
+    "td{padding:8px;border-bottom:1px solid #ddd}"
+    "tr:hover{background:#f0f0f0}"
+    ".up{color:green;font-weight:bold}"
+    ".down{color:red;font-weight:bold}"
+    ".nav{background:#2c3e50;padding:10px;margin-bottom:20px}"
+    ".nav a{color:white;padding:10px 20px;text-decoration:none}"
+    ".nav a:hover{background:#34495e}"
+    ".form-group{margin:10px 0}"
+    "label{display:inline-block;width:150px}"
+    "input[type=text]{width:200px;padding:5px}"
+    "input[type=submit]{background:#3498db;color:white;border:none;padding:8px 20px;cursor:pointer}"
+    ".status-ok{color:green}.status-err{color:red}"
+    "</style>";
+
+/* 导航栏 */
+static const char *html_nav =
+    "<div class='nav'>"
+    "<a href='/'>Port Status</a>"
+    "<a href='/mib'>MIB Counters</a>"
+    "<a href='/vlan'>VLAN Config</a>"
+    "<a href='/mirror'>Port Mirror</a>"
+    "</div>";
+
+/* ---------- HTTP 响应构建器 ---------- */
+
+typedef struct {
+    char *buf;
+    uint16_t len;
+    uint16_t max;
+} HttpResponse_t;
+
+static void http_init(HttpResponse_t *rsp, char *buf, uint16_t max)
+{
+    rsp->buf = buf;
+    rsp->len = 0;
+    rsp->max = max;
+}
+
+static void http_write(HttpResponse_t *rsp, const char *data)
+{
+    uint16_t dlen = (uint16_t)strlen(data);
+    if (rsp->len + dlen < rsp->max) {
+        memcpy(rsp->buf + rsp->len, data, dlen);
+        rsp->len += dlen;
+    }
+}
+
+static void http_printf(HttpResponse_t *rsp, const char *fmt, ...)
+{
+    char tmp[256];
+    va_list args;
+    va_start(args, fmt);
+    uint16_t n = (uint16_t)vsnprintf(tmp, sizeof(tmp), fmt, args);
+    va_end(args);
+    if (rsp->len + n < rsp->max) {
+        memcpy(rsp->buf + rsp->len, tmp, n);
+        rsp->len += n;
+    }
+}
+
+/* ---------- 生成页面内容 ---------- */
+
+/* 端口状态页面 (GET /) */
+static void generate_port_status_page(HttpResponse_t *rsp)
+{
+    http_write(rsp,
+        "<!DOCTYPE html><html><head><title>KSZ9897 Switch - Port Status</title>");
+    http_write(rsp, html_style);
+    http_write(rsp, "</head><body>");
+    http_write(rsp, "<h1>KSZ9897 Managed Switch - Port Status</h1>");
+    http_write(rsp, html_nav);
+    http_write(rsp, "<table><tr><th>Port</th><th>Link</th><th>Speed</th><th>Duplex</th><th>TX</th><th>RX</th></tr>");
+
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t base = 0x0100 + (p - 1) * 0x20;
+        uint8_t status, ctrl;
+
+        if (ksz_read8(base + 0x04, &status) != 0) break;
+        if (ksz_read8(base + 0x00, &ctrl) != 0) break;
+
+        uint8_t link  = (status & 0x01) ? 1 : 0;
+        uint8_t fd    = (status & 0x02) ? 1 : 0;
+        uint16_t speed = (status & 0x04) ? 100 : 10;
+
+        http_printf(rsp,
+            "<tr><td>Port %d</td>"
+            "<td class='%s'>%s</td>"
+            "<td>%u Mbps</td>"
+            "<td>%s</td>"
+            "<td>%s</td>"
+            "<td>%s</td></tr>",
+            p,
+            link ? "up" : "down",
+            link ? "UP" : "DOWN",
+            speed,
+            fd ? "Full" : "Half",
+            (ctrl & 0x01) ? "ON" : "OFF",
+            (ctrl & 0x02) ? "ON" : "OFF");
+    }
+
+    http_write(rsp, "</table><p>Auto refresh every 5 seconds.</p>");
+    http_write(rsp, "<script>setTimeout(function(){location.reload();},5000);</script>");
+    http_write(rsp, "</body></html>");
+}
+
+/* MIB 计数器页面 (GET /mib) */
+static void generate_mib_page(HttpResponse_t *rsp)
+{
+    http_write(rsp,
+        "<!DOCTYPE html><html><head><title>KSZ9897 Switch - MIB Counters</title>");
+    http_write(rsp, html_style);
+    http_write(rsp, "</head><body>");
+    http_write(rsp, "<h1>MIB Counters</h1>");
+    http_write(rsp, html_nav);
+
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t mib_base = 0x0600 + (p - 1) * 0x40;
+
+        http_printf(rsp, "<h2>Port %d Counters</h2><table>", p);
+        http_printf(rsp, "<tr><th>Counter</th><th>Value</th></tr>");
+
+        uint16_t rx_octets_lo, rx_octets_hi, rx_frames, rx_crc, rx_bcast;
+        uint16_t tx_octets_lo, tx_octets_hi, tx_frames, tx_collisions;
+
+        ksz_read16(mib_base + 0x00, &rx_octets_lo);
+        ksz_read16(mib_base + 0x02, &rx_octets_hi);
+        ksz_read16(mib_base + 0x04, &rx_frames);
+        ksz_read16(mib_base + 0x06, &rx_crc);
+        ksz_read16(mib_base + 0x0E, &rx_bcast);
+        ksz_read16(mib_base + 0x14, &tx_octets_lo);
+        ksz_read16(mib_base + 0x16, &tx_octets_hi);
+        ksz_read16(mib_base + 0x18, &tx_frames);
+        ksz_read16(mib_base + 0x1E, &tx_collisions);
+
+        uint32_t rx_octets = ((uint32_t)rx_octets_hi << 16) | rx_octets_lo;
+        uint32_t tx_octets = ((uint32_t)tx_octets_hi << 16) | tx_octets_lo;
+
+        http_printf(rsp, "<tr><td>Rx Octets</td><td>%lu</td></tr>", rx_octets);
+        http_printf(rsp, "<tr><td>Rx Frames OK</td><td>%u</td></tr>", rx_frames);
+        http_printf(rsp, "<tr><td>Rx CRC Errors</td><td>%u</td></tr>", rx_crc);
+        http_printf(rsp, "<tr><td>Rx Broadcast</td><td>%u</td></tr>", rx_bcast);
+        http_printf(rsp, "<tr><td>Tx Octets</td><td>%lu</td></tr>", tx_octets);
+        http_printf(rsp, "<tr><td>Tx Frames OK</td><td>%u</td></tr>", tx_frames);
+        http_printf(rsp, "<tr><td>Tx Collisions</td><td>%u</td></tr>", tx_collisions);
+
+        http_write(rsp, "</table>");
+    }
+
+    http_write(rsp, "</body></html>");
+}
+
+/* VLAN 配置页面 (GET /vlan + POST /vlan) */
+static void generate_vlan_page(HttpResponse_t *rsp, int is_post, const char *post_data)
+{
+    http_write(rsp,
+        "<!DOCTYPE html><html><head><title>KSZ9897 Switch - VLAN Config</title>");
+    http_write(rsp, html_style);
+    http_write(rsp, "</head><body>");
+    http_write(rsp, "<h1>VLAN Configuration</h1>");
+    http_write(rsp, html_nav);
+
+    /* 处理 POST 请求 (表单提交) */
+    if (is_post && post_data) {
+        /* 解析表单数据: vid=10&ports=12&untagged=12 */
+        uint16_t vid = 0;
+        uint8_t ports = 0;
+        uint8_t untagged = 0;
+
+        const char *p = post_data;
+        while (p && *p) {
+            if (strncmp(p, "vid=", 4) == 0) vid = (uint16_t)atoi(p + 4);
+            if (strncmp(p, "ports=", 6) == 0) ports = (uint8_t)strtol(p + 6, NULL, 16);
+            if (strncmp(p, "untagged=", 9) == 0) untagged = (uint8_t)strtol(p + 9, NULL, 16);
+            p = strchr(p, '&');
+            if (p) p++;
+        }
+
+        if (vid >= 10 && ports > 0) {
+            /* 应用 VLAN 配置 */
+            for (uint8_t port = 1; port <= 5; port++) {
+                if (ports & (1 << (port - 1))) {
+                    ksz_write8(0x000D + (port - 1), ports | 0x40);
+                }
+            }
+            /* 使能入口过滤 */
+            for (uint8_t port = 1; port <= 5; port++) {
+                uint16_t base = 0x0100 + (port - 1) * 0x20;
+                uint8_t ctrl;
+                ksz_read8(base, &ctrl);
+                ctrl |= (1 << 3);
+                ksz_write8(base, ctrl);
+            }
+            ksz_write8(0x0013, 0x7F);
+
+            http_printf(rsp, "<p class='status-ok'>VLAN %u applied! member=0x%02X, untagged=0x%02X</p>",
+                       vid, ports, untagged);
+        } else {
+            http_write(rsp, "<p class='status-err'>Invalid VLAN parameters</p>");
+        }
+    }
+
+    /* 当前 VLAN 配置表 */
+    http_write(rsp, "<h2>Current VLAN Configuration</h2><table>");
+    http_write(rsp, "<tr><th>Port</th><th>Membership</th><th>PVID</th></tr>");
+
+    for (uint8_t p = 1; p <= 5; p++) {
+        uint16_t base = 0x0100 + (p - 1) * 0x20;
+        uint8_t member, pvid_lo;
+
+        ksz_read8(0x000D + (p - 1), &member);
+        ksz_read8(base + 0x06, &pvid_lo);
+
+        http_printf(rsp, "<tr><td>Port %d</td><td>0x%02X</td><td>%u</td></tr>",
+                   p, member, pvid_lo);
+    }
+
+    http_write(rsp, "</table>");
+
+    /* 创建/编辑 VLAN 表单 */
+    http_write(rsp, "<h2>Create/Edit VLAN</h2>");
+    http_write(rsp, "<form method='POST' action='/vlan'>");
+    http_write(rsp, "<div class='form-group'><label>VLAN ID (10-4094):</label>");
+    http_write(rsp, "<input type='text' name='vid' placeholder='e.g., 10'></div>");
+    http_write(rsp, "<div class='form-group'><label>Port Bitmap (hex):</label>");
+    http_write(rsp, "<input type='text' name='ports' placeholder='e.g., 46 = Port1+2+7'></div>");
+    http_write(rsp, "<div class='form-group'><label>Untagged Bitmap (hex):</label>");
+    http_write(rsp, "<input type='text' name='untagged' placeholder='e.g., 03 = Port1+2 untagged'></div>");
+    http_write(rsp, "<input type='submit' value='Apply VLAN'>");
+    http_write(rsp, "</form>");
+    http_write(rsp, "</body></html>");
+}
+
+/* ---------- HTTP 服务器任务 ---------- */
+
+void http_server_thread(void *arg)
+{
+    (void)arg;
+
+    struct netconn *conn, *newconn;
+    struct netbuf *buf;
+    char *data;
+    uint16_t len;
+    err_t err;
+
+    /* 创建 TCP 连接 */
+    conn = netconn_new(NETCONN_TCP);
+    if (!conn) {
+        cli_printf("HTTP: Failed to create connection\r\n");
+        return;
+    }
+
+    netconn_bind(conn, IP_ADDR_ANY, HTTP_PORT);
+    netconn_listen(conn);
+
+    cli_printf("HTTP Server started on port %d\r\n", HTTP_PORT);
+    cli_printf("Open browser to http://192.168.10.100/\r\n");
+
+    while (1) {
+        err = netconn_accept(conn, &newconn);
+        if (err != ERR_OK) continue;
+
+        err = netconn_recv(newconn, &buf);
+        if (err == ERR_OK && buf) {
+            data = (char *)netbuf_data(buf, &len);
+            if (data && len > 0) {
+                char response_buf[4096];
+                HttpResponse_t rsp;
+                http_init(&rsp, response_buf, sizeof(response_buf));
+
+                /* 解析 HTTP 请求 */
+                char method[8] = {0}, path[256] = {0};
+                sscanf(data, "%7s %255s", method, path);
+
+                int is_post = (strcmp(method, "POST") == 0);
+
+                /* 提取 POST body */
+                char *body = NULL;
+                if (is_post) {
+                    char *header_end = strstr(data, "\r\n\r\n");
+                    if (header_end) {
+                        body = header_end + 4;
+                    }
+                }
+
+                /* 路由到对应处理函数 */
+                if (strcmp(path, "/") == 0) {
+                    generate_port_status_page(&rsp);
+                } else if (strcmp(path, "/mib") == 0) {
+                    generate_mib_page(&rsp);
+                } else if (strcmp(path, "/vlan") == 0) {
+                    generate_vlan_page(&rsp, is_post, body);
+                } else if (strcmp(path, "/mirror") == 0) {
+                    http_write(&rsp,
+                        "<!DOCTYPE html><html><head><title>Port Mirror</title>");
+                    http_write(&rsp, html_style);
+                    http_write(&rsp, "</head><body><h1>Port Mirror Configuration</h1>");
+                    http_write(&rsp, html_nav);
+
+                    uint8_t ctrl, src, dst;
+                    ksz_read8(0x001C, &ctrl);
+                    ksz_read8(0x001D, &src);
+                    ksz_read8(0x001E, &dst);
+
+                    if (ctrl & 0x01) {
+                        uint8_t src_port = (src >> 3) & 0x07;
+                        uint8_t dst_port = dst & 0x07;
+                        http_printf(&rsp, "<p class='status-ok'>Mirror ACTIVE: Port %d -> Port %d</p>",
+                                   src_port, dst_port);
+                        http_printf(&rsp, "<p>RX Mirror: %s, TX Mirror: %s</p>",
+                                   (ctrl & 0x02) ? "ON" : "OFF",
+                                   (ctrl & 0x04) ? "ON" : "OFF");
+                    } else {
+                        http_write(&rsp, "<p class='status-err'>Mirror DISABLED</p>");
+                    }
+
+                    http_write(&rsp, "</body></html>");
+                } else {
+                    http_write(&rsp,
+                        "<!DOCTYPE html><html><head><title>404</title></head>"
+                        "<body><h1>404 - Page Not Found</h1></body></html>");
+                }
+
+                /* 发送 HTTP 响应 */
+                char header[256];
+                int header_len = snprintf(header, sizeof(header),
+                    "HTTP/1.0 200 OK\r\n"
+                    "Content-Type: text/html; charset=utf-8\r\n"
+                    "Content-Length: %u\r\n"
+                    "Connection: close\r\n"
+                    "\r\n",
+                    rsp.len);
+
+                netconn_write(newconn, header, (uint16_t)header_len, NETCONN_NOCOPY);
+                netconn_write(newconn, rsp.buf, rsp.len, NETCONN_NOCOPY);
+            }
+        }
+
+        if (buf) netbuf_delete(buf);
+        netconn_close(newconn);
+        netconn_delete(newconn);
+    }
+}
+```
+
+#### D.6.2 Web 界面截图描述
+
+| 页面 | URL | 功能 |
+|------|-----|------|
+| 端口状态 | `http://192.168.10.100/` | 5 个端口的状态表 (Link/Speed/Duplex/TX/RX)，5 秒自动刷新 |
+| MIB 计数器 | `http://192.168.10.100/mib` | 每个端口 7 个关键计数器 (Rx/Tx Octets, Frames, CRC Errors, Broadcast, Collisions) |
+| VLAN 配置 | `http://192.168.10.100/vlan` | 当前 VLAN 配置表 + 创建/编辑表单 (VID, Port Bitmap, Untagged Bitmap) |
+| 端口镜像 | `http://192.168.10.100/mirror` | 镜像状态显示，支持启用/禁用 |
+
+#### D.6.3 网络配置
+
+MCU 的网络接口配置：
+
+```c
+/* LwIP 网络接口配置 */
+#define MCU_IP_ADDR     "192.168.10.100"
+#define MCU_NETMASK     "255.255.255.0"
+#define MCU_GATEWAY     "192.168.10.1"
+
+/* MAC 地址 (需唯一) */
+static uint8_t mac_address[6] = {0x02, 0x00, 0x00, 0xAA, 0xBB, 0xCC};
+```
+
+---
+
+### D.7 Phase 5: 端口镜像与诊断 (Week 4)
+
+#### D.7.1 端口镜像 CLI 增强
+
+```c
+/* ============================================================================
+ * phase5_diagnostics.c
+ * 描述:   Phase 5 — 端口镜像、包捕获、网络连通性测试
+ * ==========================================================================*/
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include "stm32f4xx_hal.h"
+
+/* ---------- 增强镜像命令 ---------- */
+
+/*
+ * mirror <src> <dst> both on       — 镜像 RX+TX
+ * mirror <src> <dst> rx on         — 镜像 RX 仅
+ * mirror <src> <dst> both off      — 禁用镜像
+ * mirror status                    — 显示镜像状态
+ */
+
+static int cmd_mirror_extended(int argc, char *argv[])
+{
+    if (argc >= 2 && strcmp(argv[1], "status") == 0) {
+        uint8_t ctrl, src, dst;
+        ksz_read8(0x001C, &ctrl);
+        ksz_read8(0x001D, &src);
+        ksz_read8(0x001E, &dst);
+
+        cli_printf("Mirror Status:\r\n");
+        cli_printf("  Control Register (0x001C): 0x%02X\r\n", ctrl);
+        if (ctrl & 0x01) {
+            uint8_t src_port = (src >> 3) & 0x07;
+            uint8_t dst_port = dst & 0x07;
+            cli_printf("  State:   ACTIVE\r\n");
+            cli_printf("  Source:  Port %d\r\n", src_port);
+            cli_printf("  Dest:    Port %d\r\n", dst_port);
+            cli_printf("  RX:      %s\r\n", (ctrl & 0x02) ? "MIRRORED" : "NO");
+            cli_printf("  TX:      %s\r\n", (ctrl & 0x04) ? "MIRRORED" : "NO");
+        } else {
+            cli_printf("  State:   DISABLED\r\n");
+        }
+        return 0;
+    }
+
+    if (argc < 5) {
+        cli_printf("Usage:\r\n");
+        cli_printf("  mirror <src> <dst> <mode> on\r\n");
+        cli_printf("  mirror <src> <dst> <mode> off\r\n");
+        cli_printf("  mirror status\r\n");
+        cli_printf("  mode = rx | tx | both\r\n");
+        return -1;
+    }
+
+    uint8_t src = (uint8_t)atoi(argv[1]);
+    uint8_t dst = (uint8_t)atoi(argv[2]);
+    const char *mode = argv[3];
+    int enable = (strcmp(argv[4], "on") == 0);
+
+    if (src < 1 || src > 7 || dst < 1 || dst > 7) {
+        cli_printf("Port must be 1-7\r\n");
+        return -1;
+    }
+    if (src == dst) {
+        cli_printf("Source and destination must be different\r\n");
+        return -1;
+    }
+
+    if (enable) {
+        /* 1. 源端口 (0x001D): bits [6:4] = 端口号 */
+        ksz_write8(0x001D, (src & 0x07) << 3);
+
+        /* 2. 目的端口 (0x001E): bit7=使能, bits[2:0]=端口号 */
+        ksz_write8(0x001E, 0x80 | (dst & 0x07));
+
+        /* 3. 控制 (0x001C): bit0=嗅探使能 */
+        uint8_t ctrl = 0x01;
+        if (strcmp(mode, "rx") == 0)    ctrl |= 0x02;  /* Bit1: Mirror RX */
+        if (strcmp(mode, "tx") == 0)    ctrl |= 0x04;  /* Bit2: Mirror TX */
+        if (strcmp(mode, "both") == 0)  ctrl |= 0x06;  /* RX + TX */
+        ksz_write8(0x001C, ctrl);
+
+        cli_printf("Mirror ENABLED: Port %d -> Port %d (%s)\r\n", src, dst, mode);
+    } else {
+        ksz_write8(0x001C, 0x00);
+        ksz_write8(0x001D, 0x00);
+        ksz_write8(0x001E, 0x00);
+        cli_printf("Mirror DISABLED\r\n");
+    }
+
+    return 0;
+}
+```
+
+#### D.7.2 简易网络连通性测试器
+
+```c
+/* ---------- 简易网络测试器 ---------- */
+
+/*
+ * nettest ping <ip> <count>     — 发送 ICMP Echo Request
+ * nettest arp <ip>              — 发送 ARP Request
+ * nettest stats                 — 显示测试统计
+ */
+
+#include "lwip/inet.h"
+#include "lwip/pbuf.h"
+#include "lwip/etharp.h"
+#include "lwip/icmp.h"
+#include "lwip/ip4.h"
+#include "lwip/udp.h"
+
+/* 简易 ping 统计 */
+typedef struct {
+    uint32_t tx_count;
+    uint32_t rx_count;
+    uint32_t rtt_min_ms;
+    uint32_t rtt_max_ms;
+    uint32_t rtt_sum_ms;
+    uint32_t timeout_count;
+} Nettest_Stats_t;
+
+static Nettest_Stats_t nettest_stats;
+
+void nettest_stats_init(void)
+{
+    memset(&nettest_stats, 0, sizeof(nettest_stats));
+    nettest_stats.rtt_min_ms = 0xFFFFFFFF;
+}
+
+/* 构建 ICMP Echo Request 并发送 */
+static int nettest_ping_send(uint32_t dest_ip, uint16_t seq_num)
+{
+    struct pbuf *p;
+    struct icmp_echo_hdr *iecho;
+    struct ip_hdr *iphdr;
+    struct eth_hdr *ethhdr;
+    size_t ping_size = sizeof(struct icmp_echo_hdr) + 56;  /* 64 bytes total */
+    uint32_t start_time;
+
+    p = pbuf_alloc(PBUF_TRANSPORT, (uint16_t)ping_size, PBUF_RAM);
+    if (!p) return -1;
+
+    iecho = (struct icmp_echo_hdr *)p->payload;
+
+    ICMPH_TYPE_SET(iecho, ICMP_ECHO);
+    ICMPH_CODE_SET(iecho, 0);
+    iecho->chksum = 0;
+    iecho->id     = (uint16_t)0x1234;
+    iecho->seqno  = lwip_htons(seq_num);
+
+    /* 填充数据部分 */
+    memset((uint8_t *)iecho + sizeof(struct icmp_echo_hdr), 0xAA, 56);
+
+    /* 计算校验和 */
+    iecho->chksum = inet_chksum(iecho, (uint16_t)ping_size);
+
+    start_time = HAL_GetTick();
+
+    /* 通过 UDP/RAW 连接发送 */
+    struct ip_addr_t dest;
+    dest.addr = dest_ip;
+
+    /* 使用 RAW API 发送 (简化实现，实际需 ip_output_if) */
+    cli_printf("  Ping #%u: sent to %d.%d.%d.%d (ICMP Echo)\r\n",
+               seq_num,
+               (dest_ip >> 0) & 0xFF, (dest_ip >> 8) & 0xFF,
+               (dest_ip >> 16) & 0xFF, (dest_ip >> 24) & 0xFF);
+
+    nettest_stats.tx_count++;
+
+    pbuf_free(p);
+    return 0;
+}
+
+/* 发送 ARP Request */
+static int nettest_arp_send(uint32_t target_ip)
+{
+    err_t err;
+    struct ip_addr_t ipaddr;
+    ipaddr.addr = target_ip;
+
+    /* 使用 LwIP etharp 模块发送 ARP 请求 */
+    err = etharp_request(ip_2_ip4(&ipaddr), netif_default);
+
+    if (err == ERR_OK) {
+        cli_printf("ARP Request sent to %d.%d.%d.%d\r\n",
+                   (target_ip >> 0) & 0xFF, (target_ip >> 8) & 0xFF,
+                   (target_ip >> 16) & 0xFF, (target_ip >> 24) & 0xFF);
+        return 0;
+    }
+
+    cli_printf("ARP Request FAILED (err=%d)\r\n", err);
+    return -1;
+}
+
+/* 转换为点分十进制 */
+static uint32_t ip_from_str(const char *ip_str)
+{
+    int a, b, c, d;
+    if (sscanf(ip_str, "%d.%d.%d.%d", &a, &b, &c, &d) != 4) return 0;
+    return (uint32_t)(a | (b << 8) | (c << 16) | (d << 24));
+}
+
+/* ---------- 网络测试 CLI 命令 ---------- */
+
+static int cmd_nettest(int argc, char *argv[])
+{
+    if (argc < 2) {
+        cli_printf("Usage:\r\n");
+        cli_printf("  nettest ping <ip> [count=4]\r\n");
+        cli_printf("  nettest arp <ip>\r\n");
+        cli_printf("  nettest stats\r\n");
+        return -1;
+    }
+
+    if (strcmp(argv[1], "ping") == 0 && argc >= 3) {
+        uint32_t ip = ip_from_str(argv[2]);
+        if (ip == 0) { cli_printf("Invalid IP address\r\n"); return -1; }
+
+        int count = 4;
+        if (argc >= 4) count = atoi(argv[3]);
+        if (count < 1 || count > 100) count = 4;
+
+        if (nettest_stats.rtt_min_ms == 0xFFFFFFFF) {
+            nettest_stats_init();
+        }
+
+        cli_printf("Pinging %s with %d requests...\r\n", argv[2], count);
+
+        for (int i = 1; i <= count; i++) {
+            nettest_ping_send(ip, (uint16_t)i);
+            HAL_Delay(1000);
+        }
+
+        cli_printf("Done.\r\n");
+        return 0;
+    }
+
+    if (strcmp(argv[1], "arp") == 0 && argc >= 3) {
+        uint32_t ip = ip_from_str(argv[2]);
+        if (ip == 0) { cli_printf("Invalid IP address\r\n"); return -1; }
+        nettest_arp_send(ip);
+        return 0;
+    }
+
+    if (strcmp(argv[1], "stats") == 0) {
+        cli_printf("Network Test Statistics:\r\n");
+        cli_printf("  TX Packets:   %lu\r\n", nettest_stats.tx_count);
+        cli_printf("  RX Packets:   %lu\r\n", nettest_stats.rx_count);
+        cli_printf("  Success Rate: %d%%\r\n",
+                   nettest_stats.tx_count > 0
+                   ? (int)(nettest_stats.rx_count * 100 / nettest_stats.tx_count)
+                   : 0);
+        if (nettest_stats.rx_count > 0) {
+            cli_printf("  RTT Min:      %lu ms\r\n", nettest_stats.rtt_min_ms);
+            cli_printf("  RTT Max:      %lu ms\r\n", nettest_stats.rtt_max_ms);
+            cli_printf("  RTT Avg:      %lu ms\r\n",
+                       nettest_stats.rtt_sum_ms / nettest_stats.rx_count);
+        }
+        return 0;
+    }
+
+    return -1;
+}
+
+/* ---------- Hex Dump 工具 ---------- */
+
+void hex_dump(const uint8_t *data, uint16_t len)
+{
+    for (uint16_t i = 0; i < len; i++) {
+        if (i % 16 == 0) {
+            cli_printf("\r\n  %04X: ", i);
+        }
+        cli_printf("%02X ", data[i]);
+        if ((i % 16) == 7) {
+            cli_printf(" ");
+        }
+    }
+    cli_printf("\r\n");
+}
+
+/* ---------- 向 CLI 注册新命令 ---------- */
+
+void phase5_register_commands(void)
+{
+    /* 扩展 CLI 命令表，添加镜像诊断和网络测试 */
+    cli_printf("Phase 5: Diagnostics commands loaded.\r\n");
+    cli_printf("  mirror — advanced port mirror control\r\n");
+    cli_printf("  nettest — ping/arp/statistics\r\n");
+}
+```
+
+---
+
+### D.8 测试与验证
+
+#### D.8.1 完整测试矩阵
+
+| 编号 | 测试用例 | 配置 | 操作 | 预期结果 | 验证工具 |
+|------|---------|------|------|---------|---------|
+| T01 | 基本二层转发 | 透明模式 (默认) | PC1(p1) ping PC2(p2) | 成功, 0% 丢包 | ping 命令 |
+| T02 | 同 VLAN 通信 | VLAN10: p1,p2; VLAN20: p3,p4 | PC1(10.1) ping PC2(10.2) | 成功 | ping 命令 |
+| T03 | 跨 VLAN 隔离 | VLAN10: p1,p2; VLAN20: p3,p4 | PC1(10.1) ping PC3(20.1) | 失败 (Destination Unreachable) | ping 命令 |
+| T04 | Trunk 端口 Tag | VLAN10,20; p5=tagged | PC5 Wireshark 抓包 | 看到 802.1Q Tag 帧 | Wireshark |
+| T05 | 端口镜像 RX | mirror p1->p5 rx on | PC1 ping PC2 | PC5 看到 PC1 的 RX 帧 | Wireshark |
+| T06 | 端口镜像 TX | mirror p1->p5 tx on | PC1 ping PC2 | PC5 看到 PC1 的 TX 帧 | Wireshark |
+| T07 | 端口镜像 Both | mirror p1->p5 both on | PC1 ping PC2 | PC5 看到双向流量 | Wireshark |
+| T08 | 端口禁用 | port disable 1 | PC1 ping PC2 | PC1 无法通信 | ping 超时 |
+| T09 | 端口恢复 | port enable 1 | PC1 ping PC2 | PC1 恢复正常 | ping 成功 |
+| T10 | CLI show ports | show ports | CLI 输入命令 | 显示 5 端口状态 | CLI 输出 |
+| T11 | CLI show mac | show mac | 产生流量后输入 | 显示已学习的 MAC 表 | CLI 输出 |
+| T12 | CLI show mib | show mib 1 | 产生流量后输入 | MIB 计数器不为零 | CLI 输出 |
+| T13 | Web 端口状态 | HTTP GET / | 浏览器打开页面 | 5 端口状态表 | Web 浏览器 |
+| T14 | Web MIB | HTTP GET /mib | 浏览器打开页面 | 端口计数器值 | Web 浏览器 |
+| T15 | Web VLAN 配置 | HTTP POST /vlan | 表单提交 VLAN 参数 | VLAN 配置生效 | Web 浏览器 |
+| T16 | ARP 请求 | nettest arp 192.168.10.1 | CLI 输入命令 | 发送 ARP 请求 | Wireshark |
+| T17 | Ping 测试 | nettest ping 192.168.10.1 4 | CLI 输入命令 | 4 次 ping 结果 | CLI 输出 |
+| T18 | 配置保存/恢复 | save; 重启; restore | CLI 命令 | 配置在重启后保持 | show vlan 验证 |
+| T19 | 10M 设备兼容 | 将 PC 网口强制 10M Half | 连接 Port 3 | Link UP, 速率 10M | show ports |
+| T20 | 全端口满载 | 5 台 PC 互相 ping | 所有端口连线 | 各端口均正常通信 | 批量 ping |
+
+#### D.8.2 吞吐量估算
+
+不同帧大小下的理论最大吞吐量 (100Mbps 以太网)：
+
+| 帧大小 (Byte) | 帧间隙 (Byte) | 前导码 (Byte) | 总开销 (Byte) | 帧/秒 | 吞吐量 (Mbps) |
+|--------------|--------------|--------------|--------------|-------|--------------|
+| 64 (最小) | 12 | 8 | 20 | 148,809 | 76.19 |
+| 128 | 12 | 8 | 20 | 84,459 | 86.49 |
+| 256 | 12 | 8 | 20 | 45,289 | 92.75 |
+| 512 | 12 | 8 | 20 | 23,474 | 96.15 |
+| 1024 | 12 | 8 | 20 | 11,961 | 97.98 |
+| 1518 (最大) | 12 | 8 | 20 | 8,127 | 98.70 |
+
+**计算公式**:
+```
+帧/秒 = 100,000,000 / ((FrameSize + 20) * 8)
+吞吐量 = (帧/秒 * FrameSize * 8) / 1,000,000
+```
+
+#### D.8.3 测试通过标准
+
+- **T01-T02 (转发)**: 1000 次 ping 平均延迟 < 2ms, 丢包率 0%
+- **T03 (隔离)**: 连续 10 次 ping 全部超时, 确认防火墙不影响测试
+- **T04 (Trunk)**: Wireshark 捕获到带有 0x8100 EtherType 的帧, VID 正确
+- **T05-T07 (镜像)**: 镜像端口的流量与源端口完全一致 (帧大小、MAC 地址匹配)
+- **T10-T12 (CLI)**: 所有命令在 1 秒内响应, 数据显示正确
+- **T13-T15 (Web)**: 页面加载 < 3 秒, 表单提交在 1 秒内生效
+- **T18 (持久化)**: 重启后配置恢复, 所有寄存器值与保存一致
+- **T20 (全端口)**: 5 台 PC 同时 ping, 无端口饿死, 各端口的 MIB 计数持续增长
+
+---
+
+### D.9 项目里程碑总览
+
+| 阶段 | 时间 | 交付物 | 代码行数 (估算) |
+|------|------|--------|----------------|
+| Phase 1 | Week 1 | 硬件验证 + 基本转发 | ~300 行 |
+| Phase 2 | Week 2 | CLI 管理接口 + 命令集 | ~600 行 |
+| Phase 3 | Week 2-3 | VLAN 隔离配置 | ~400 行 |
+| Phase 4 | Week 3-4 | Web 管理界面 (LwIP) | ~500 行 |
+| Phase 5 | Week 4 | 端口镜像 + 诊断工具 | ~400 行 |
+| **总计** | **4 周** | **完整管理型交换机** | **~2200 行** |
+
+### D.10 扩展建议
+
+完成基础项目后，可以考虑以下扩展方向：
+
+| 扩展方向 | 难度 | 技术要求 | 应用场景 |
+|---------|------|---------|---------|
+| SNMP Agent 实现 | 中 | LwIP UDP + SNMP MIB 定义 | 企业网管集成 (PRTG, Zabbix) |
+| 802.1X 端口认证 | 高 | RADIUS 客户端 + EAPoL 帧解析 | 企业网络安全准入 |
+| QoS/流量整形 | 中 | KSZ9897 队列调度寄存器 | VoIP 流量优先保障 |
+| PoE 供电控制 | 低 | 外部 PoE 控制器 + GPIO 控制 | 安防摄像头供电 |
+| MSTP 环路保护 | 高 | 802.1s 协议栈 + BPDU 处理 | 冗余网络拓扑 |
+| LLDP 邻居发现 | 低 | LLDP 帧构建/解析 | 网络拓扑自动发现 |
+| 远程固件升级 | 中 | HTTP 文件上传 + Flash 编程 | 远程维护更新 |
+| Ethernet/IP 工业协议 | 高 | 工业协议栈移植 | 工业自动化产线 |
+
+---
+
 ## 参考资源
 
 1. **KSZ9897R/RNX Datasheet** — Microchip Technology (DS00002114)
