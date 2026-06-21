@@ -218,9 +218,11 @@ int main(void) {
 | 文档 | 说明 | 行数 | 难度 |
 |------|------|------|------|
 | `MCU_Startup_Flow_Deep_Dive.md` | MCU 从复位到 main() 的完整启动流程，含链接脚本、启动文件、SystemInit、内存布局、RTOS 启动时间线及不同架构对比 | ~2600 | Intermediate |
-| `Ethernet_PHY_Switch_Deep_Dive.md` | PHY/Switch 驱动知识体系，含 MII/RMII 时序、MDIO 协议、IEEE 802.3 寄存器、自动协商、链路检测、LAN8720/DP83848 实战代码及交换芯片基础 | ~2600 | Intermediate |
-| `MCU_Ethernet_Protocols_Deep_Dive.md` | 网络协议全栈逐字节拆解，含以太网帧、ARP、IP、ICMP、UDP、TCP、VLAN、STP、IGMP、LLDP，每个协议均配有 WireShark 实验和 C 代码示例 | ~3800 | Intermediate |
-| `STM32_KSZ9897_Switch_Driver.md` | STM32 + KSZ9897 交换芯片完整驱动实现，含 SPI 通信、初始化、VLAN/MAC 管理、MIB 统计、数据处理及 CLI 监控接口 | ~2500 | Advanced |
+| `Ethernet_PHY_Switch_Deep_Dive.md` | PHY/Switch 驱动知识体系，含 MII/RMII 时序、MDIO 协议、IEEE 802.3 寄存器、自动协商、链路检测、LAN8720/DP83848 实战代码及交换芯片基础 | ~5300 | Intermediate |
+| `MCU_Ethernet_Protocols_Deep_Dive.md` | 网络协议全栈逐字节拆解，含以太网帧、ARP、IP、ICMP、UDP、TCP、VLAN、STP、IGMP、LLDP，每个协议均配有 WireShark 实验和 C 代码示例 | ~9300 | Intermediate/Advanced |
+| `STM32_KSZ9897_Switch_Driver.md` | STM32 + KSZ9897 交换芯片完整驱动实现，含 SPI 通信、初始化、VLAN/MAC 管理、MIB 统计、数据处理及 CLI 监控接口 | ~6200 | Advanced |
+| `QUICK_REFERENCE.md` | 速查参考手册：PHY 寄存器、Switch 寄存器、协议 EtherType、常用端口、调试命令、CRC32、位操作等 | ~400 | All |
+| `FAQ.md` | 初学者常见问题 30 问，覆盖 MCU 启动、PHY 硬件/驱动、网络协议、交换机、调试 | ~800 | Beginner |
 
 ## 仓库结构
 
